@@ -7,12 +7,16 @@ uniform sampler2D paper_tex : source_color, filter_linear_mipmap_anisotropic, re
 uniform sampler2D fiber_normal : hint_normal, filter_linear_mipmap, repeat_enable;
 uniform sampler2D mottle : filter_linear_mipmap, repeat_enable;
 uniform float inside_dark = 0.6;   // how dark the inside (back side) of the paper is
+uniform vec3 bend = vec3(0.0);     // how far this point is bent (floppy paper)
 uniform float web = 0.0;           // 1 = simple web renderer: matte paper, almost no bumps
 
 varying vec2 extra;                // x = ambient occlusion (crevices), y = marker amount
 
 void vertex() {
 	extra = UV2;
+	// COLOR.a = how far out along the point: the base stays put, the tip bends the most
+	float w = clamp(COLOR.a, 0.0, 1.0);
+	VERTEX += bend * w * w;
 }
 
 void fragment() {

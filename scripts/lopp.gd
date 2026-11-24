@@ -20,7 +20,7 @@ const PaperPiece := preload("res://scripts/paper_piece.gd")
 const PaperShader := preload("res://scripts/paper.gdshader")
 
 const S := 1.0            # half the width (the lopp is 2 units wide, about 8 cm in real life)
-const DEPTH := 1.05       # how far the points stick out
+const DEPTH := 1.15       # how far the points stick out (about as tall as they are wide, like a real one)
 const SUB := 9            # each paper face is cut into SUB*SUB cells
 const THICK := 0.026      # paper thickness you see on cut/torn edges
 const VIS_OFF := Vector3(0, 0, -DEPTH * 0.5)
@@ -118,6 +118,18 @@ var torn_g := {}              # points in space that touch a rip
 var snaps_since_check := 0    # no snapped bonds = nothing can have come loose
 var _ground := false
 
+# ---- floppy paper: every point is a spring that lags behind, wobbles and droops ----
+var tips: Array = []            # rest position of each point's tip
+var pocket_mats: Array = []     # one material per point, so each can bend on its own
+var bend: Array = [Vector3.ZERO, Vector3.ZERO, Vector3.ZERO, Vector3.ZERO]
+var bend_v: Array = [Vector3.ZERO, Vector3.ZERO, Vector3.ZERO, Vector3.ZERO]
+var stiff: Array = []           # hand-folded: some points are softer than others
+var last_vel := Vector3.ZERO
+var last_yaw := 0.0
+var squash := 0.0
+var squash_v := 0.0
+var was_ground := true
+
 
 func _ready() -> void:
 	noise.seed = randi()
@@ -152,6 +164,11 @@ func _ready() -> void:
 		var mi := MeshInstance3D.new()
 		(jaw_up if q % 2 == 1 else jaw_lo).add_child(mi)   # q = 1,3 are the upper points
 		pockets.append(mi)
+		var pmat: ShaderMaterial = mat.duplicate()
+		pocket_mats.append(pmat)
+		mi.material_override = pmat
+		stiff.append(randf_range(90.0, 170.0))
+	last_yaw = global_rotation.y
 	coff.resize(ncells * 3)
 	dirty_q = 15
 	_rebuild()
@@ -174,7 +191,9 @@ func _build_paper() -> void:
 			var c1 := _corner(Vector3(sx * S, 0, 0), true)
 			var c2 := _corner(Vector3(sx * S, sy * S, 0), false)
 			var c3 := _corner(Vector3(0, sy * S, 0), false)
-			var tip := Vector3(sx * randf_range(0.04, 0.1), sy * randf_range(0.04, 0.1), DEPTH * randf_range(0.95, 1.04))
+			# the tip sits above the middle of its own square (each point is its own pyramid)
+			var tip := Vector3(sx * S * randf_range(0.44, 0.56), sy * S * randf_range(0.44, 0.56), DEPTH * randf_range(0.93, 1.05))
+			tips.append(tip)
 			var inside := Vector3(sx * S * 0.35, sy * S * 0.35, DEPTH * 0.25)
 			var col: Color = pal[q]
 			var outer := {"bow": randf_range(0.035, 0.06), "col": col, "marker": 0.93, "lift_opp": -1, "lift": Vector3.ZERO}
@@ -452,7 +471,7 @@ func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3) -> Array:
 					norms.append(outn)
 					uvs.append(cuv[c * 3 + k])
 					uv2s.append(Vector2(1.05, 0.0))
-					cols.append(Color(1, 1, 1, 0))
+					cols.append(Color(1, 1, 1, clampf(p.z / DEPTH, 0.0, 1.0)))
 	var arr := []
 	arr.resize(Mesh.ARRAY_MAX)
 	arr[Mesh.ARRAY_VERTEX] = verts
@@ -623,6 +642,7 @@ func receive_hit(gpoint: Vector3, gsource: Vector3, power: float, radius: float,
 		open_target = 0.0
 	state = "stun"
 	stun_t = 0.2 + 0.12 * power
+	kick_points(push, 2.5 * power, lp)
 	if main:
 		main.paper_bits(gpoint, -(global_transform.basis * push), 18 + int(power * 14))
 		if lost > 30:
@@ -970,8 +990,8 @@ func _physics_process(delta: float) -> void:
 
 func _process(delta: float) -> void:
 	# the jaws are springy paper: they overshoot and bounce when they snap shut
-	var k := 320.0
-	open_v += ((open_target - open) * k - open_v * 20.0) * delta
+	var k := 170.0 if not dead else 25.0
+	open_v += ((open_target - open) * k - open_v * 9.0) * delta
 	open += open_v * delta
 	if open < 0.0:
 		open = 0.0
@@ -987,8 +1007,48 @@ func _process(delta: float) -> void:
 	visual.rotation = Vector3(pitch + lean.x, 0, lean.y)
 	shake = maxf(0.0, shake - delta * 0.8)
 	visual.position = VIS_OFF + Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)) * shake * 0.4
+	_flop(delta)
 	if dirty_q != 0:
 		_rebuild(false)   # spread the work: one point per frame
+
+
+## Paper is floppy: when the lopp jumps, turns or gets hit, the points lag behind and wobble
+## (like a jelly glued at the bottom). The bending itself happens in the shader, so no mesh rebuild.
+func _flop(delta: float) -> void:
+	if delta <= 0.0:
+		return
+	var inv := visual.global_transform.basis.inverse()
+	var vel: Vector3 = inv * linear_velocity
+	var dv := (vel - last_vel).limit_length(12.0)
+	last_vel = vel
+	var dyaw := wrapf(global_rotation.y - last_yaw, -PI, PI)
+	last_yaw = global_rotation.y
+	var down: Vector3 = inv * Vector3.DOWN
+	var grounded := _ground
+	if grounded and not was_ground:
+		squash_v -= clampf(-dv.y, 0.0, 10.0) * 0.12   # landing: squish a little
+	was_ground = grounded
+	for q in 4:
+		var kq: float = stiff[q] * (0.3 if dead else 1.0)
+		var tipv: Vector3 = tips[q]
+		# the body moved, the soft tips get left behind; turning swings them sideways
+		bend_v[q] += -dv * 0.32 + Vector3(-dyaw * tipv.z * 1.4, 0, 0)
+		var f: Vector3 = -bend[q] * kq - bend_v[q] * 4.5 + down * kq * 0.045   # spring + damping + droop
+		bend_v[q] += f * delta
+		bend[q] = (bend[q] + bend_v[q] * delta).limit_length(0.45)
+		var jaw: Node3D = pockets[q].get_parent()
+		pocket_mats[q].set_shader_parameter("bend", jaw.transform.basis.inverse() * bend[q])
+	squash_v += (-squash * 260.0 - squash_v * 10.0) * delta
+	squash += squash_v * delta
+	visual.scale = Vector3(1.0 - squash * 0.5, 1.0 + squash, 1.0 - squash * 0.5)
+
+
+func kick_points(dir: Vector3, amount: float, near := Vector3.INF) -> void:
+	for q in 4:
+		var f := 1.0
+		if near != Vector3.INF:
+			f = clampf(1.2 - (tips[q] as Vector3).distance_to(near) / 1.6, 0.25, 1.0)
+		bend_v[q] += dir * amount * f * randf_range(0.8, 1.2)
 
 
 func _facing_enemy() -> float:
@@ -1000,6 +1060,7 @@ func _bite_hit() -> void:
 	var c := snap_charge
 	var mouth := to_global(Vector3(0, 0, DEPTH * 0.5 + 0.1))
 	main.sfx("snap", mouth, 0.0)
+	kick_points(Vector3(0, 0, 1), 1.6 + 1.5 * snap_charge)
 	if enemy == null or enemy.dead:
 		return
 	var info: Dictionary = enemy.nearest_cell(mouth)
@@ -1016,6 +1077,8 @@ func _smash_land() -> void:
 	state = "idle"
 	pitch_target = 0.0
 	main.sfx("thump", global_position, 0.0)
+	kick_points(Vector3(0, -1, 0.3), 3.5)
+	squash_v -= 1.2
 	var hit := false
 	if enemy and not enemy.dead:
 		var to: Vector3 = enemy.global_position - global_position
