@@ -13,6 +13,10 @@ func _ready() -> void:
 	linear_damp = 0.3
 	angular_damp = 1.2
 	can_sleep = true
+	var pm := PhysicsMaterial.new()
+	pm.friction = 1.0    # paper grips the desk, it does not slide like ice
+	pm.bounce = 0.0      # and it never bounces
+	physics_material_override = pm
 
 
 func _integrate_forces(st: PhysicsDirectBodyState3D) -> void:
@@ -26,6 +30,9 @@ func _integrate_forces(st: PhysicsDirectBodyState3D) -> void:
 	st.apply_central_force(-n * vn * absf(vn) * k)
 	# air also tips the piece so it rocks back and forth (falling-leaf motion)
 	st.apply_torque(n.cross(v.normalized()) * vn * k * 0.05)
+	# a little drag along the flat side too, so pieces glide instead of shooting sideways
+	var vt := v - n * vn
+	st.apply_central_force(-vt * vt.length() * k * 0.08)
 
 
 func _process(_delta: float) -> void:

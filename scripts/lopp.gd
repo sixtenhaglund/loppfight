@@ -123,6 +123,11 @@ var link_check := {}          # cells next to a fresh rip: they might be hanging
 var peel_seeds := {}          # cell -> how much the paper peels up there (collected during a hit)
 var snaps_since_check := 0    # no snapped bonds = nothing can have come loose
 var _ground := false
+var hitboxes: Array = []        # CollisionShape3D per point
+var bash_cd := 0.0
+var bash_t := 0.0
+var bash_hit := false
+var ai_retreat_t := 0.0
 var contact: MeshInstance3D       # soft dark spot on the desk right under the lopp
 var contact_mat: StandardMaterial3D
 
@@ -157,11 +162,13 @@ func _ready() -> void:
 	pm.friction = 0.9
 	pm.bounce = 0.05
 	physics_material_override = pm
-	var cs := CollisionShape3D.new()
-	var box := BoxShape3D.new()
-	box.size = Vector3(2 * S * 1.04, 2 * S * 1.04, DEPTH - HZ)
-	cs.shape = box
-	add_child(cs)
+	# hitboxes: one shape per point, rebuilt from the paper that is still there (rips change them)
+	for q in 4:
+		var hcs := CollisionShape3D.new()
+		hcs.shape = ConvexPolygonShape3D.new()
+		hcs.position = VIS_OFF
+		add_child(hcs)
+		hitboxes.append(hcs)
 
 	visual = Node3D.new()
 	visual.position = VIS_OFF
@@ -173,6 +180,14 @@ func _ready() -> void:
 	_make_materials()
 	_make_contact_shadow()
 	_build_paper()
+	# real paper tips never stand perfectly straight: each one is folded over a little
+	for q in 4:
+		var axis: Vector3 = ((tips[q] as Vector3) - (base_c[q] as Vector3)).normalized()
+		var r := Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1))
+		var perp := axis.cross(r).normalized()
+		bend_set[q] = perp * randf_range(0.06, 0.15)
+		bend[q] = bend_set[q]
+		fold_at[q] = randf_range(0.5, 0.7)
 	for q in 4:
 		var mi := MeshInstance3D.new()
 		(jaw_up if q % 2 == 1 else jaw_lo).add_child(mi)   # q = 1,3 are the upper points
@@ -214,7 +229,7 @@ func _build_paper() -> void:
 			tips.append(tip)
 			var inside := Vector3(sx * S * 0.35, sy * S * 0.35, DEPTH * 0.25)
 			var col: Color = pal[q]
-			var outer := {"bow": randf_range(0.06, 0.1), "col": col, "marker": 0.93, "lift_opp": -1, "lift": Vector3.ZERO}
+			var outer := {"bow": randf_range(0.012, 0.025), "col": col, "marker": 0.93, "lift_opp": -1, "lift": Vector3.ZERO}
 			var inner := {"bow": -randf_range(0.005, 0.015), "col": Color.WHITE, "marker": 0.0, "lift_opp": -1, "lift": Vector3.ZERO}
 			# outside of the point: one square folded along the diagonal (c2 -> tip)
 			# the pocket opening flares out and curls back a little (bent paper, not a cut edge)
@@ -243,7 +258,7 @@ func _build_paper() -> void:
 	for i in cv.size():
 		var g := gpos[cgid[i]]
 		var keep := clampf(absf(g.y) / 0.25, 0.0, 1.0)   # stay put on the middle fold
-		cdisp[i] = Vector3(wave.get_noise_3dv(g), wave.get_noise_3dv(g + Vector3(31, 0, 0)), wave.get_noise_3dv(g + Vector3(0, 47, 0))) * 0.03 * keep
+		cdisp[i] = Vector3(wave.get_noise_3dv(g), wave.get_noise_3dv(g + Vector3(31, 0, 0)), wave.get_noise_3dv(g + Vector3(0, 47, 0))) * 0.012 * keep
 
 
 var _corners := {}
@@ -468,7 +483,7 @@ func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3, bent := f
 	var cols := PackedColorArray()
 	for idx in cnt:
 		var c := cells[idx]
-		var torn := false
+		var torn := cdmg[c] > 0.35   # crumpled paper = flat facets with sharp creases
 		var dshade := 1.0 - clampf(cdmg[c] * 0.12, 0.0, 0.28)
 		# Godot treats clockwise triangles as the front, so add them 0, 2, 1
 		for kk in 3:
@@ -494,10 +509,10 @@ func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3, bent := f
 			if cedge[c * 3 + k].size() > 0:   # this edge used to be glued = it is a RIP, not a cut edge
 				var ga := cgid[c * 3 + k]
 				var gb := cgid[c * 3 + (k + 1) % 3]
-				var wa := 0.01 + 0.025 * absf(_hrand(hash(ga) >> 3) * 2.0)
+				var wa := 0.006 + 0.034 * absf(_hrand(hash(ga) >> 3) * 2.0)
 				var wb := 0.01 + 0.025 * absf(_hrand(hash(gb) >> 3) * 2.0)
 				var mid := (a + b) * 0.5
-				var wm := 0.006 + 0.03 * absf(_hrand(hash(ga * 7 + gb) >> 5) * 2.0)
+				var wm := 0.003 + 0.045 * absf(_hrand(hash(ga * 7 + gb) >> 5) * 2.0)
 				var lift_n := fn[idx] * 0.002
 				var fa := a + outn * wa + lift_n
 				var fb := b + outn * wb + lift_n
@@ -593,10 +608,27 @@ func _rebuild(all := true) -> void:
 			mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, _arrays_for(list, ident, Vector3.ZERO))
 			mesh.surface_set_material(0, mat)
 		pockets[q].mesh = mesh
+		_update_hitbox(q, list)
 		if not all:
 			break
 	if main:
 		main.perf_note("rebuild", Time.get_ticks_usec() - t0)
+
+
+## Wrap a shape around the paper of point q that is still attached (a sample of its corners is enough)
+func _update_hitbox(q: int, list: PackedInt32Array) -> void:
+	var hcs: CollisionShape3D = hitboxes[q]
+	if list.size() < 6:
+		hcs.disabled = true
+		return
+	var pts := PackedVector3Array()
+	var step := maxi(1, list.size() / 70)
+	for i in range(0, list.size(), step):
+		var c := list[i]
+		for k in 3:
+			pts.append(cv[c * 3 + k] + cdisp[c * 3 + k])
+	(hcs.shape as ConvexPolygonShape3D).points = pts
+	hcs.disabled = false
 
 
 # ================================================================ damage
@@ -607,9 +639,10 @@ func _touch(c: int) -> void:
 			coff_dirty[cgid[c * 3 + k]] = true
 
 
-func _add_dent(center: Vector3, r: float, d: Vector3) -> void:
+func _add_dent(center: Vector3, r: float, d: Vector3, bump := 0.0) -> void:
 	var dl := d.length()
 	var off := Vector3(randf() * 50, randf() * 50, randf() * 50)
+	var off2 := Vector3(randf() * 50, randf() * 50, randf() * 50)
 	for i in cv.size():
 		var v := cv[i]
 		var dist := v.distance_to(center)
@@ -618,7 +651,11 @@ func _add_dent(center: Vector3, r: float, d: Vector3) -> void:
 			f = f * f * (3.0 - 2.0 * f)
 			var p := v * 3.6 + off
 			var nz := Vector3(noise.get_noise_3dv(p), noise.get_noise_3dv(p + Vector3(19, 7, 3)), noise.get_noise_3dv(p + Vector3(5, 23, 11)))
-			cdisp[i] = (cdisp[i] + d * f + nz * dl * 1.5 * f).limit_length(0.28)   # dent + sharp creases (never deeper than this)
+			var bz := Vector3.ZERO
+			if bump > 0.0:   # lots of small crinkle bumps where it was hit
+				var p2 := v * 11.0 + off2
+				bz = Vector3(noise.get_noise_3dv(p2), noise.get_noise_3dv(p2 + Vector3(13, 0, 0)), noise.get_noise_3dv(p2 + Vector3(0, 0, 29))) * bump
+			cdisp[i] = (cdisp[i] + d * f + nz * dl * 1.5 * f + bz * f).limit_length(0.28)   # dent + sharp creases (never deeper than this)
 			dirty_q |= 1 << cquad[i / 3]
 
 
@@ -644,12 +681,14 @@ func receive_hit(gpoint: Vector3, gsource: Vector3, power: float, radius: float,
 			_touch(c)
 
 	if kind == "smash":
-		_add_dent(lp, radius * 1.4, push * 0.26 * power)
+		_add_dent(lp, radius * 1.4, push * 0.26 * power, 0.03 * power)
+	elif kind == "bash":
+		_add_dent(lp, radius * 1.3, push * 0.18 * power, 0.035)   # wide, shallow, crinkly
 	else:
 		# teeth marks: the two jaws pinch the paper from above and below
 		var up := Vector3(0, 0.14, 0)
-		_add_dent(lp + up, radius * 0.8, (push + Vector3(0, -0.6, 0)).normalized() * 0.16 * power)
-		_add_dent(lp - up, radius * 0.8, (push + Vector3(0, 0.6, 0)).normalized() * 0.16 * power)
+		_add_dent(lp + up, radius * 0.8, (push + Vector3(0, -0.6, 0)).normalized() * 0.16 * power, 0.022 * power)
+		_add_dent(lp - up, radius * 0.8, (push + Vector3(0, 0.6, 0)).normalized() * 0.16 * power, 0.022 * power)
 
 	var snapped := PackedInt32Array()
 	# only bonds next to damaged cells can snap
@@ -676,7 +715,7 @@ func receive_hit(gpoint: Vector3, gsource: Vector3, power: float, radius: float,
 			if (da > 1.1) != (db > 1.1):
 				stress += 0.7     # teeth rip along the edge of the bite
 		else:
-			stress *= 0.6         # smashing mostly crumples
+			stress *= 0.35 if kind == "bash" else 0.6   # smashing/bashing mostly crumples
 		if stress > 1.0 and randf() < clampf((stress - 1.0) * 1.5 + 0.35, 0.0, 1.0):
 			_break_bond(bi)
 			snapped.append(bi)
@@ -707,7 +746,8 @@ func receive_hit(gpoint: Vector3, gsource: Vector3, power: float, radius: float,
 	if state == "charge" or state == "snap":
 		open_target = 0.0
 	state = "stun"
-	stun_t = 0.2 + 0.12 * power
+	stun_t = 0.45 if kind == "bash" else 0.2 + 0.12 * power
+	ai_retreat_t = 0.7
 	kick_points(push, 2.5 * power, lp)
 	fold_points(push, power, lp)
 	if main:
@@ -917,11 +957,18 @@ func _spawn_debris(list: PackedInt32Array, push: Vector3) -> void:
 	if list.size() < 40:
 		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	rb.add_child(mi)
+	# collision = a shape wrapped around the real piece (with a bit of thickness so it isn't paper-thin
+	# for the physics engine), instead of an invisible box
 	var cs := CollisionShape3D.new()
-	var box := BoxShape3D.new()
-	box.size = aabb.size.max(Vector3.ONE * 0.03)
-	cs.shape = box
-	cs.position = aabb.get_center()
+	var shp := ConvexPolygonShape3D.new()
+	var vtx: PackedVector3Array = arr[Mesh.ARRAY_VERTEX]
+	var hp_pts := PackedVector3Array()
+	var stp := maxi(1, vtx.size() / 40)
+	for i in range(0, vtx.size(), stp):
+		hp_pts.append(vtx[i] + pn * 0.012)
+		hp_pts.append(vtx[i] - pn * 0.012)
+	shp.points = hp_pts
+	cs.shape = shp
 	rb.add_child(cs)
 	rb.mass = maxf(0.004, 0.003 * list.size())
 	main.add_debris(rb, center)
@@ -986,6 +1033,34 @@ func cmd_smash() -> void:
 	main.sfx("open", global_position, -2.0)
 
 
+## BASH: a quick ram with the whole body. Little damage, big knockback (push them off the desk!)
+func cmd_bash() -> void:
+	if dead or not active or bash_cd > 0.0 or not (state == "idle" or state == "charge"):
+		return
+	if not _grounded():
+		return
+	state = "bash"
+	bash_t = 0.0
+	bash_hit = false
+	bash_cd = 1.1
+	open_target = 0.0
+	linear_velocity = _flat(global_transform.basis.z) * 11.0 + Vector3.UP * 1.8
+	main.sfx("open", global_position, -2.0)
+
+
+func _bash_hit(to: Vector3) -> void:
+	var front := to_global(VIS_OFF + Vector3(0, 0, DEPTH * 0.6))
+	var info: Dictionary = enemy.nearest_cell(front)
+	var ok: bool = enemy.receive_hit(info.p, global_position, 1.0, 0.9, "bash", 5.0, _flat(to) * 9.5 + Vector3.UP * 3.0, 0.0)
+	if ok:
+		main.sfx("thump", info.p, 2.0)
+		main.sfx("crumple", info.p, -3.0)
+		main.on_hit(self, enemy, 0.7)
+	linear_velocity *= 0.2
+	kick_points(Vector3(0, 0, -1), 2.5)
+	_add_dent(Vector3(0, 0, DEPTH * 0.9), 0.5, Vector3(0, 0, -0.04), 0.02)   # ramming crumples your own front a bit
+
+
 func cmd_dodge() -> void:
 	if dead or not active or dodge_cd > 0.0 or not (state == "idle" or state == "charge"):
 		return
@@ -1048,6 +1123,8 @@ func _physics_process(delta: float) -> void:
 	bite_cd = maxf(0.0, bite_cd - delta)
 	smash_cd = maxf(0.0, smash_cd - delta)
 	dodge_cd = maxf(0.0, dodge_cd - delta)
+	bash_cd = maxf(0.0, bash_cd - delta)
+	ai_retreat_t = maxf(0.0, ai_retreat_t - delta)
 	if dead:
 		return
 	if global_position.y < -4.0:
@@ -1090,13 +1167,25 @@ func _physics_process(delta: float) -> void:
 		"stun":
 			if stun_t <= 0.0:
 				state = "idle"
+		"bash":
+			bash_t += delta
+			pitch_target = 0.3
+			if not bash_hit and enemy and not enemy.dead:
+				var to: Vector3 = enemy.global_position - global_position
+				to.y = 0
+				if to.length() < 2.3 and _facing_enemy() > 0.3:
+					bash_hit = true
+					_bash_hit(to)
+			if bash_t > 0.32:
+				state = "idle"
+				pitch_target = 0.0
 
 	# moving = little paper hops
 	var mv := in_move
 	mv.y = 0
 	if mv.length() > 1.0:
 		mv = mv.normalized()
-	if state == "snap" or state == "smash" or state == "stun":
+	if state == "snap" or state == "smash" or state == "stun" or state == "bash":
 		mv = Vector3.ZERO
 	if state == "charge":
 		mv *= 0.45
@@ -1105,7 +1194,7 @@ func _physics_process(delta: float) -> void:
 		linear_velocity = Vector3(v.x, HOP_UP, v.z)
 		hop_t = HOP_EVERY
 		main.sfx("hop", global_position, -8.0)
-	elif grounded and mv.length() <= 0.15 and state != "snap" and state != "smash":
+	elif grounded and mv.length() <= 0.15 and state != "snap" and state != "smash" and state != "bash":
 		linear_velocity.x = move_toward(linear_velocity.x, 0.0, 18.0 * delta)
 		linear_velocity.z = move_toward(linear_velocity.z, 0.0, 18.0 * delta)
 
@@ -1120,7 +1209,7 @@ func _process(delta: float) -> void:
 		open_v = -open_v * 0.35
 	for q in 4:
 		pocket_mats[q].set_shader_parameter("jaw", _jaw_angle(q))
-	if state != "smash" and state != "dead":
+	if state != "smash" and state != "dead" and state != "bash":
 		pitch_target = 0.0
 	pitch = lerpf(pitch, pitch_target, 1.0 - exp(-12.0 * delta))
 	# lean into the movement a little, like something light being pushed around
@@ -1328,8 +1417,16 @@ func _ai(delta: float) -> void:
 		ai_t = randf_range(think[0], think[1])
 		if randf() < 0.15:
 			ai_strafe = -ai_strafe
-		if enemy.state == "charge" and d < 2.6 and randf() < dodge_p:
+		var bash_p: float = [0.04, 0.1, 0.16][ai_level]
+		var ep: Vector3 = enemy.global_position
+		var near_edge: bool = absf(ep.x) > main.desk_half.x - 4.0 or absf(ep.z) > main.desk_half.y - 3.0
+		if enemy.state == "stun" and d < 2.6 and bite_cd <= 0.0 and randf() < bite_p + 0.2:
+			cmd_bite_start()   # punish: they are dizzy, go for a big bite
+			ai_charge_goal = randf_range(0.35, 0.6)
+		elif enemy.state == "charge" and d < 2.6 and randf() < dodge_p:
 			cmd_dodge()
+		elif d < 3.0 and bash_cd <= 0.0 and ((near_edge and randf() < 0.5) or randf() < bash_p):
+			cmd_bash()   # ram them towards the edge
 		elif d < 2.4 and bite_cd <= 0.0 and randf() < bite_p:
 			cmd_bite_start()
 			ai_charge_goal = randf_range(0.1, 0.4) if ai_level == 0 else randf_range(0.2 + 0.1 * ai_level, 0.7)
@@ -1338,6 +1435,8 @@ func _ai(delta: float) -> void:
 	var want_d := 1.9 if bite_cd <= 0.0 else 3.0
 	if hp < 35.0:
 		want_d += 1.0
+	if ai_retreat_t > 0.0:
+		want_d += 1.5   # just got hit: back off a bit
 	var mv := dir * clampf(d - want_d, -1.0, 1.0) + right * ai_strafe * 0.6
 	# stay away from the edge of the desk
 	var p := global_position

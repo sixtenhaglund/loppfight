@@ -305,6 +305,8 @@ func _build_howto() -> void:
 		"RIGHT CLICK or K - SMASH: jump and slam face-first\n" + \
 		"      crumples them, but missing leaves you dizzy\n" + \
 		"SPACE - dodge hop to the side\n" + \
+		"E / SHIFT / MIDDLE CLICK - BASH: ram them with your body\n" + \
+		"      little damage, huge knockback - push them off the desk!\n" + \
 		"Esc or P - pause\n\n" + \
 		"Rips run along the paper and love following creases.\n" + \
 		"Tear off a whole point and they lose a lot of HP.\n" + \
@@ -431,7 +433,7 @@ func _build_hud() -> void:
 	msg.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	hud.add_child(msg)
 	hint = Label.new()
-	hint.text = "WASD move  ·  hold LEFT CLICK = bite  ·  RIGHT CLICK = smash  ·  SPACE = dodge  ·  Esc = pause"
+	hint.text = "WASD move  ·  hold LEFT CLICK = bite  ·  RIGHT CLICK = smash  ·  SPACE = dodge  ·  E = bash  ·  Esc = pause"
 	hint.add_theme_font_size_override("font_size", 22)
 	_outline(hint, 6)
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER

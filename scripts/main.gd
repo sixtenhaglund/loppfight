@@ -110,6 +110,7 @@ func _inputs() -> void:
 	_key("bite", [KEY_J], MOUSE_BUTTON_LEFT)
 	_key("smash", [KEY_K], MOUSE_BUTTON_RIGHT)
 	_key("dodge", [KEY_SPACE])
+	_key("bash", [KEY_E, KEY_SHIFT], MOUSE_BUTTON_MIDDLE)
 	_key("restart", [KEY_R])
 	_key("pause", [KEY_ESCAPE, KEY_P])
 
@@ -166,7 +167,7 @@ func perf_note(what: String, usec: int) -> void:
 func paper_bits(pos: Vector3, dir: Vector3, amount: int) -> void:
 	if bit_mesh == null:
 		bit_mesh = QuadMesh.new()
-		bit_mesh.size = Vector2(0.05, 0.035)
+		bit_mesh.size = Vector2(0.028, 0.012)   # thin fibres, not confetti squares
 		var m := StandardMaterial3D.new()
 		m.albedo_color = Color(0.95, 0.94, 0.9)
 		m.roughness = 0.95
@@ -175,13 +176,13 @@ func paper_bits(pos: Vector3, dir: Vector3, amount: int) -> void:
 	var p := CPUParticles3D.new()
 	p.mesh = bit_mesh
 	p.one_shot = true
-	p.amount = amount
-	p.lifetime = 1.6
+	p.amount = maxi(1, amount / 2)
+	p.lifetime = 0.7   # fibres puff out and are gone before they reach the desk
 	p.explosiveness = 0.95
 	p.direction = dir.normalized() if dir.length() > 0.01 else Vector3.UP
 	p.spread = 70.0
 	p.initial_velocity_min = 1.0
-	p.initial_velocity_max = 4.5
+	p.initial_velocity_max = 3.0
 	p.gravity = Vector3(0, -5.0, 0)
 	p.damping_min = 2.0
 	p.damping_max = 5.0
@@ -195,7 +196,39 @@ func paper_bits(pos: Vector3, dir: Vector3, amount: int) -> void:
 	add_child(p)
 	p.global_position = pos
 	p.emitting = true
-	get_tree().create_timer(2.5).timeout.connect(p.queue_free)
+	get_tree().create_timer(1.5).timeout.connect(p.queue_free)
+	# ...and a few real paper crumbs that land on the desk and stay there
+	for i in clampi(amount / 10, 0, 3):
+		_crumb(pos, dir)
+
+
+var crumb_mesh: ArrayMesh
+
+
+func _crumb(pos: Vector3, dir: Vector3) -> void:
+	if crumb_mesh == null:
+		crumb_mesh = ArrayMesh.new()
+		var arr := []
+		arr.resize(Mesh.ARRAY_MAX)
+		arr[Mesh.ARRAY_VERTEX] = PackedVector3Array([Vector3(-0.05, 0, -0.03), Vector3(0.06, 0, -0.02), Vector3(0, 0, 0.06)])
+		arr[Mesh.ARRAY_NORMAL] = PackedVector3Array([Vector3.UP, Vector3.UP, Vector3.UP])
+		crumb_mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+		crumb_mesh.surface_set_material(0, bit_mesh.material)
+	var rb = preload("res://scripts/paper_piece.gd").new()
+	var mi := MeshInstance3D.new()
+	mi.mesh = crumb_mesh
+	mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	rb.add_child(mi)
+	var cs := CollisionShape3D.new()
+	var bs := BoxShape3D.new()
+	bs.size = Vector3(0.1, 0.012, 0.08)
+	cs.shape = bs
+	rb.add_child(cs)
+	rb.mass = 0.003
+	add_debris(rb, pos)
+	rb.rotation = Vector3(randf() * TAU, randf() * TAU, randf() * TAU)
+	rb.linear_velocity = dir.normalized() * randf_range(1.0, 3.0) + Vector3.UP * randf_range(1.0, 3.0)
+	rb.angular_velocity = Vector3(randf_range(-10, 10), randf_range(-10, 10), randf_range(-10, 10))
 
 
 func on_hit(_attacker, _victim, strength: float) -> void:
@@ -648,6 +681,8 @@ func _process(delta: float) -> void:
 			player.cmd_smash()
 		if Input.is_action_just_pressed("dodge"):
 			player.cmd_dodge()
+		if Input.is_action_just_pressed("bash"):
+			player.cmd_bash()
 
 	_settle_debris(delta)
 	if not shot_cam:
