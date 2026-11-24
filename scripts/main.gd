@@ -19,6 +19,8 @@ var t := 0.0
 var hitstop_until := 0
 var ko_until := 0
 var autotest := false
+var shooting := false
+var shot_cam := false
 var hits := 0
 
 var hp_fill := {}
@@ -29,6 +31,7 @@ var hint: Label
 func _ready() -> void:
 	randomize()
 	autotest = "autotest" in OS.get_cmdline_user_args()
+	shooting = "shot" in OS.get_cmdline_user_args()
 	_inputs()
 	_load_sounds()
 	_environment()
@@ -44,6 +47,10 @@ func _ready() -> void:
 	cpu.died.connect(_on_died)
 	_camera()
 	_hud()
+	if shooting:
+		autotest = true
+		player.is_ai = true
+		_shots()
 	if autotest:
 		print("AUTOTEST: cells per lopp = ", player.ncells, ", bonds = ", player.nbonds)
 
@@ -121,6 +128,45 @@ func add_debris(rb: RigidBody3D, pos: Vector3) -> void:
 			old.queue_free()
 
 
+var bit_mesh: QuadMesh
+
+
+## Little paper fibres and crumbs that fly out of a hit.
+func paper_bits(pos: Vector3, dir: Vector3, amount: int) -> void:
+	if bit_mesh == null:
+		bit_mesh = QuadMesh.new()
+		bit_mesh.size = Vector2(0.05, 0.035)
+		var m := StandardMaterial3D.new()
+		m.albedo_color = Color(0.95, 0.94, 0.9)
+		m.roughness = 0.95
+		m.cull_mode = BaseMaterial3D.CULL_DISABLED
+		bit_mesh.material = m
+	var p := CPUParticles3D.new()
+	p.mesh = bit_mesh
+	p.one_shot = true
+	p.amount = amount
+	p.lifetime = 1.6
+	p.explosiveness = 0.95
+	p.direction = dir.normalized() if dir.length() > 0.01 else Vector3.UP
+	p.spread = 70.0
+	p.initial_velocity_min = 1.0
+	p.initial_velocity_max = 4.5
+	p.gravity = Vector3(0, -5.0, 0)
+	p.damping_min = 2.0
+	p.damping_max = 5.0
+	p.angular_velocity_min = -720.0
+	p.angular_velocity_max = 720.0
+	p.angle_min = 0.0
+	p.angle_max = 360.0
+	p.scale_amount_min = 0.4
+	p.scale_amount_max = 1.3
+	p.particle_flag_align_y = false
+	add_child(p)
+	p.global_position = pos
+	p.emitting = true
+	get_tree().create_timer(2.5).timeout.connect(p.queue_free)
+
+
 func on_hit(_attacker, _victim, strength: float) -> void:
 	hits += 1
 	cam_shake = maxf(cam_shake, 0.08 + 0.12 * strength)
@@ -160,6 +206,32 @@ func _environment() -> void:
 	sun.shadow_blur = 1.5
 	add_child(sun)
 
+	# The web version (Compatibility renderer) has no SSAO/SSIL bounce light, so shadowed sides go
+	# black. There we add soft extra light instead.
+	if RenderingServer.get_current_rendering_method() == "gl_compatibility":
+		env.ambient_light_energy = 2.2
+		var fill := DirectionalLight3D.new()
+		fill.rotation_degrees = Vector3(-25, 35 + 180, 0)
+		fill.light_energy = 0.75
+		fill.light_color = Color(0.85, 0.9, 1.0)
+		fill.light_specular = 0.0
+		add_child(fill)
+		var top := DirectionalLight3D.new()
+		top.rotation_degrees = Vector3(-90, 0, 0)
+		top.light_energy = 0.35
+		top.light_specular = 0.0
+		add_child(top)
+
+	var lamp := SpotLight3D.new()   # warm desk lamp from the other side: makes the folds pop
+	lamp.position = Vector3(-9, 9, -5)
+	lamp.look_at_from_position(lamp.position, Vector3(0, 0, 0))
+	lamp.light_color = Color(1.0, 0.82, 0.6)
+	lamp.light_energy = 18.0
+	lamp.spot_range = 30.0
+	lamp.spot_angle = 40.0
+	lamp.spot_attenuation = 1.0
+	add_child(lamp)
+
 
 func _desk() -> void:
 	var wood := StandardMaterial3D.new()
@@ -167,6 +239,8 @@ func _desk() -> void:
 	wood.normal_enabled = true
 	wood.normal_texture = load("res://assets/textures/desk_nor_gl.jpg")
 	wood.roughness_texture = load("res://assets/textures/desk_rough.jpg")
+	wood.albedo_color = Color(0.78, 0.72, 0.66)   # less orange
+	wood.metallic_specular = 0.25                 # less plastic shine
 	wood.uv1_triplanar = true
 	wood.uv1_scale = Vector3(0.05, 0.05, 0.05)
 	wood.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC
@@ -318,8 +392,9 @@ func _update_camera(delta: float) -> void:
 	dir.y = 0
 	dir = dir.normalized() if dir.length() > 0.01 else Vector3(0, 0, -1)
 	var side := Vector3(dir.z, 0, -dir.x)
-	var want := p - dir * 5.5 + Vector3.UP * 3.3 + side * 1.3
-	var look := p.lerp(e, 0.4) + Vector3.UP * 0.3
+	# three-quarter view: you see both lopps from the side, so you see their shape, not just a back
+	var want := p - dir * 3.6 + Vector3.UP * 2.6 + side * 3.6
+	var look := p.lerp(e, 0.45) + Vector3.UP * 0.1
 	var k := 1.0 - exp(-(1.5 if state == "intro" else 4.0) * delta)
 	cam.global_position = cam.global_position.lerp(want, k)
 	cam.look_at(look)
@@ -414,7 +489,7 @@ func _process(delta: float) -> void:
 		get_tree().reload_current_scene()
 		return
 
-	if state == "intro" and t > (0.3 if autotest else 1.6):
+	if state == "intro" and not shooting and t > (0.3 if autotest else 1.6):
 		state = "fight"
 		msg.text = "FIGHT!"
 		player.active = true
@@ -441,7 +516,8 @@ func _process(delta: float) -> void:
 		if Input.is_action_just_pressed("dodge"):
 			player.cmd_dodge()
 
-	_update_camera(delta)
+	if not shot_cam:
+		_update_camera(delta)
 	_update_hud()
 
 	if autotest:
@@ -453,3 +529,40 @@ func _process(delta: float) -> void:
 		if (state == "over" and now > ko_until + 500) or t > 60.0:
 			print("AUTOTEST DONE t=", snappedf(t, 0.1), " hp ", snappedf(player.hp, 0.1), "/", snappedf(cpu.hp, 0.1), " hits ", hits, " debris ", debris.size())
 			get_tree().quit()
+
+
+# ================================================================ screenshots (for checking the look):  godot --path . -- shot
+func _shots() -> void:
+	await get_tree().create_timer(1.5).timeout
+	var dir := OS.get_user_data_dir() + "/shots"
+	DirAccess.make_dir_recursive_absolute(dir)
+	var p: Vector3 = player.global_position
+	var f: Vector3 = player.global_transform.basis.z
+	var views := {
+		"front": [p + f * 3.2 + Vector3(0.6, 0.6, 0), p],
+		"back": [p - f * 3.2 + Vector3(0.8, 0.8, 0), p],
+		"side": [p + Vector3(3.2, 1.0, 0.3), p],
+		"game": [Vector3.ZERO, Vector3.ZERO],
+		"damage": [Vector3.ZERO, Vector3.ZERO],
+	}
+	for name in views:
+		shot_cam = name != "game"
+		if name == "damage":
+			await get_tree().create_timer(7.0).timeout
+			var c: Vector3 = cpu.global_position
+			var cf: Vector3 = cpu.global_transform.basis.z
+			views[name] = [c + cf * 2.6 + cpu.global_transform.basis.x * 1.6 + Vector3.UP * 1.2, c]
+		if shot_cam:
+			cam.global_position = views[name][0]
+			cam.look_at(views[name][1])
+			cam_attr.dof_blur_far_distance = 20.0
+		else:
+			state = "fight"
+			player.active = true
+			cpu.active = true
+			await get_tree().create_timer(6.0).timeout
+		for i in 6:
+			await get_tree().process_frame
+		get_viewport().get_texture().get_image().save_png(dir + "/" + name + ".png")
+	print("SHOTS ", dir)
+	get_tree().quit()
