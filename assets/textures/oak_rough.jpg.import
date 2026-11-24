@@ -2,16 +2,16 @@
 
 importer="texture"
 type="CompressedTexture2D"
-uid="uid://bbhb7efcfylla"
-path="res://.godot/imported/desk_rough.jpg-fe94193882983353885cd1165ff9c374.ctex"
+uid="uid://dtyxh8h2c2ml8"
+path="res://.godot/imported/oak_rough.jpg-e077d7592bd21558f52826d4e9994e55.ctex"
 metadata={
 "vram_texture": false
 }
 
 [deps]
 
-source_file="res://assets/textures/desk_rough.jpg"
-dest_files=["res://.godot/imported/desk_rough.jpg-fe94193882983353885cd1165ff9c374.ctex"]
+source_file="res://assets/textures/oak_rough.jpg"
+dest_files=["res://.godot/imported/oak_rough.jpg-e077d7592bd21558f52826d4e9994e55.ctex"]
 
 [params]
 

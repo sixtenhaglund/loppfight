@@ -270,16 +270,17 @@ func _environment() -> void:
 
 func _desk() -> void:
 	var wood := StandardMaterial3D.new()
-	wood.albedo_texture = load("res://assets/textures/desk_diff.jpg")
+	# light oak veneer, like a Swedish school desk
+	wood.albedo_texture = load("res://assets/textures/oak_diff.jpg")
 	wood.normal_enabled = true
-	wood.normal_texture = load("res://assets/textures/desk_nor_gl.jpg")
-	wood.roughness_texture = load("res://assets/textures/desk_rough.jpg")
-	wood.albedo_color = Color(0.78, 0.72, 0.66)   # less orange
-	wood.metallic_specular = 0.25                 # less plastic shine
+	wood.normal_texture = load("res://assets/textures/oak_nor_gl.jpg")
+	wood.normal_scale = 0.6
+	wood.roughness_texture = load("res://assets/textures/oak_rough.jpg")
+	wood.metallic_specular = 0.35
 	if RenderingServer.get_current_rendering_method() == "gl_compatibility":
-		wood.albedo_color = Color(0.6, 0.55, 0.52)   # the web renderer shows colours stronger
+		wood.albedo_color = Color(0.85, 0.83, 0.8)   # the web renderer shows colours stronger
 	wood.uv1_triplanar = true
-	wood.uv1_scale = Vector3(0.05, 0.05, 0.05)
+	wood.uv1_scale = Vector3(0.045, 0.045, 0.045)   # one texture = about 90 cm of real desk
 	wood.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC
 
 	var desk := StaticBody3D.new()
@@ -328,6 +329,7 @@ func _desk() -> void:
 func _props() -> void:
 	_pencil(Vector3(-10.5, 0, 5.0), 20.0, Color(0.95, 0.75, 0.12))
 	_pencil(Vector3(10.0, 0, 5.6), -35.0, Color(0.7, 0.12, 0.1))
+	_notebook(Vector3(-10.0, 0, -4.2), 18.0, Color(0.16, 0.32, 0.62))
 	# eraser
 	var er := StaticBody3D.new()
 	var mi := MeshInstance3D.new()
@@ -347,6 +349,51 @@ func _props() -> void:
 	er.position = Vector3(11.0, 0.225, -5.0)
 	er.rotation.y = 0.4
 	add_child(er)
+
+
+## A closed school exercise book (skrivbok): a stack of pages with a thin coloured cover on top
+func _notebook(pos: Vector3, yaw_deg: float, cover: Color) -> void:
+	var size := Vector3(3.8, 0.14, 5.3)   # A5 = about 15 x 21 cm
+	var body := StaticBody3D.new()
+	var pages := MeshInstance3D.new()
+	var pm := BoxMesh.new()
+	pm.size = Vector3(size.x - 0.06, size.y - 0.03, size.z - 0.06)
+	pages.mesh = pm
+	var pmat := StandardMaterial3D.new()
+	pmat.albedo_color = Color(0.95, 0.94, 0.9)
+	pmat.roughness = 0.95
+	pages.material_override = pmat
+	pages.position.y = (size.y - 0.03) / 2.0
+	body.add_child(pages)
+	for y in [0.012, size.y - 0.012]:   # back cover and front cover
+		var c := MeshInstance3D.new()
+		var cm := BoxMesh.new()
+		cm.size = Vector3(size.x, 0.024, size.z)
+		c.mesh = cm
+		var cmat := StandardMaterial3D.new()
+		cmat.albedo_color = cover
+		cmat.roughness = 0.75
+		c.material_override = cmat
+		c.position.y = y
+		body.add_child(c)
+	var label := MeshInstance3D.new()   # the white name label on the cover
+	var lm := BoxMesh.new()
+	lm.size = Vector3(2.0, 0.004, 0.8)
+	label.mesh = lm
+	var lmat := StandardMaterial3D.new()
+	lmat.albedo_color = Color(0.97, 0.97, 0.95)
+	label.material_override = lmat
+	label.position = Vector3(0, size.y + 0.002, -1.3)
+	body.add_child(label)
+	var cs := CollisionShape3D.new()
+	var bs := BoxShape3D.new()
+	bs.size = size
+	cs.shape = bs
+	cs.position.y = size.y / 2.0
+	body.add_child(cs)
+	body.position = pos
+	body.rotation_degrees.y = yaw_deg
+	add_child(body)
 
 
 func _pencil(pos: Vector3, yaw_deg: float, paint: Color) -> void:
@@ -649,6 +696,7 @@ func _shots() -> void:
 			player.active = true
 			cpu.active = true
 			await get_tree().create_timer(6.0).timeout
+			_print_perf()
 		for i in 6:
 			await get_tree().process_frame
 		get_viewport().get_texture().get_image().save_png(dir + "/" + name + ".png")
@@ -676,3 +724,13 @@ func _uishots() -> void:
 		get_viewport().get_texture().get_image().save_png(dir + "/ui_pause.png")
 	print("UISHOTS ", dir)
 	get_tree().quit()
+
+
+func _print_perf() -> void:
+	print("PERFSTATS fps ", Engine.get_frames_per_second(),
+		" | process ", snappedf(Performance.get_monitor(Performance.TIME_PROCESS) * 1000.0, 0.01), " ms",
+		" | physics ", snappedf(Performance.get_monitor(Performance.TIME_PHYSICS_PROCESS) * 1000.0, 0.01), " ms",
+		" | draw calls ", Performance.get_monitor(Performance.RENDER_TOTAL_DRAW_CALLS_IN_FRAME),
+		" | objects ", Performance.get_monitor(Performance.RENDER_TOTAL_OBJECTS_IN_FRAME),
+		" | triangles ", Performance.get_monitor(Performance.RENDER_TOTAL_PRIMITIVES_IN_FRAME),
+		" | debris ", debris.size(), " | physics bodies ", Performance.get_monitor(Performance.PHYSICS_3D_ACTIVE_OBJECTS))

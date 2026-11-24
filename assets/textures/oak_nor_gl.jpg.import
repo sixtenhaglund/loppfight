@@ -2,16 +2,16 @@
 
 importer="texture"
 type="CompressedTexture2D"
-uid="uid://c8gd6kooideo"
-path="res://.godot/imported/desk_nor_gl.jpg-321861bb50e1d3eacc0c40a2e4eacd9f.ctex"
+uid="uid://dbt0xndybh1ta"
+path="res://.godot/imported/oak_nor_gl.jpg-a1538f1234043efc4ed3911d7bfd1706.ctex"
 metadata={
 "vram_texture": false
 }
 
 [deps]
 
-source_file="res://assets/textures/desk_nor_gl.jpg"
-dest_files=["res://.godot/imported/desk_nor_gl.jpg-321861bb50e1d3eacc0c40a2e4eacd9f.ctex"]
+source_file="res://assets/textures/oak_nor_gl.jpg"
+dest_files=["res://.godot/imported/oak_nor_gl.jpg-a1538f1234043efc4ed3911d7bfd1706.ctex"]
 
 [params]
 

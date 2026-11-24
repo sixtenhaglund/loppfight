@@ -123,6 +123,8 @@ var link_check := {}          # cells next to a fresh rip: they might be hanging
 var peel_seeds := {}          # cell -> how much the paper peels up there (collected during a hit)
 var snaps_since_check := 0    # no snapped bonds = nothing can have come loose
 var _ground := false
+var contact: MeshInstance3D       # soft dark spot on the desk right under the lopp
+var contact_mat: StandardMaterial3D
 
 # ---- floppy paper: every point is a spring that lags behind, wobbles and droops ----
 var tips: Array = []            # rest position of each point's tip
@@ -169,6 +171,7 @@ func _ready() -> void:
 	visual.add_child(jaw_up)
 	visual.add_child(jaw_lo)
 	_make_materials()
+	_make_contact_shadow()
 	_build_paper()
 	for q in 4:
 		var mi := MeshInstance3D.new()
@@ -911,6 +914,8 @@ func _spawn_debris(list: PackedInt32Array, push: Vector3) -> void:
 	rb.nrm_local = avg_n.normalized() if avg_n.length() > 0.01 else Vector3.UP
 	var mi := MeshInstance3D.new()
 	mi.mesh = mesh
+	if list.size() < 40:
+		mi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	rb.add_child(mi)
 	var cs := CollisionShape3D.new()
 	var box := BoxShape3D.new()
@@ -1037,8 +1042,12 @@ func nearest_cell(gp: Vector3) -> Dictionary:
 
 
 func _physics_process(delta: float) -> void:
-	for t in ["hop_t", "stun_t", "invuln_t", "bite_cd", "smash_cd", "dodge_cd"]:
-		set(t, maxf(0.0, get(t) - delta))
+	hop_t = maxf(0.0, hop_t - delta)
+	stun_t = maxf(0.0, stun_t - delta)
+	invuln_t = maxf(0.0, invuln_t - delta)
+	bite_cd = maxf(0.0, bite_cd - delta)
+	smash_cd = maxf(0.0, smash_cd - delta)
+	dodge_cd = maxf(0.0, dodge_cd - delta)
 	if dead:
 		return
 	if global_position.y < -4.0:
@@ -1120,6 +1129,7 @@ func _process(delta: float) -> void:
 	visual.rotation = Vector3(pitch + lean.x, 0, lean.y)
 	shake = maxf(0.0, shake - delta * 0.8)
 	visual.position = VIS_OFF + Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)) * shake * 0.4
+	_update_contact()
 	_flop(delta)
 	if dirty_q != 0:
 		_rebuild(false)   # spread the work: one point per frame
@@ -1158,6 +1168,43 @@ func _flop(delta: float) -> void:
 
 ## Paper bends, it doesn't slide: turn the tip movement into a rotation around a spot along the point
 ## (pivot). Everything beyond the pivot curves around it - more and more towards the tip.
+## Real objects always have a soft dark spot where they touch the table (light can't get in there).
+## It fades and grows when the lopp jumps, like a real shadow of something lifting off.
+func _make_contact_shadow() -> void:
+	var g := Gradient.new()
+	g.set_color(0, Color(0, 0, 0, 0.55))
+	g.set_color(1, Color(0, 0, 0, 0))
+	var gt := GradientTexture2D.new()
+	gt.gradient = g
+	gt.fill = GradientTexture2D.FILL_RADIAL
+	gt.fill_from = Vector2(0.5, 0.5)
+	gt.fill_to = Vector2(1.0, 0.5)
+	gt.width = 128
+	gt.height = 128
+	contact_mat = StandardMaterial3D.new()
+	contact_mat.albedo_texture = gt
+	contact_mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	contact_mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	var pm := PlaneMesh.new()
+	pm.size = Vector2(2.7, 2.4)
+	contact = MeshInstance3D.new()
+	contact.mesh = pm
+	contact.material_override = contact_mat
+	contact.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	contact.top_level = true   # don't tilt with the lopp, stay flat on the desk
+	add_child(contact)
+
+
+func _update_contact() -> void:
+	var h := maxf(0.0, global_position.y - S)
+	var f := clampf(1.0 - h / 2.5, 0.0, 1.0)
+	contact.global_position = Vector3(global_position.x, 0.003, global_position.z)
+	contact.rotation = Vector3(0, global_rotation.y, 0)
+	contact.scale = Vector3.ONE * (1.0 + h * 0.25)
+	contact_mat.albedo_color = Color(1, 1, 1, f * (0.6 if dead else 1.0))
+	contact.visible = global_position.y > -1.0
+
+
 func _jaw_angle(q: int) -> float:
 	return -open if q % 2 == 1 else open * 0.3   # q 1,3 = upper points
 
