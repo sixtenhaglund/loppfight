@@ -84,6 +84,7 @@ var cglue := PackedFloat32Array()   # 0..1 dried glue on this cell
 var face_p: Array = []              # corners of every face of the first layer (for drawing)
 var tape_bind: Array = []           # per tape: [[cell, b0, b1, b2], ...] where its points sit
 var tape_mats: Array = []
+var tape_mis: Array = []            # tape has its own mesh: clear tape casts (almost) no shadow
 var atts: Array = []                # shields, paper rods, paper teeth
 var paint_tex: ImageTexture
 var paint_dirty := false
@@ -228,6 +229,10 @@ func _ready() -> void:
 		tm.set_shader_parameter("wrinkle", mat.get_shader_parameter("mottle"))
 		tm.set_shader_parameter("floor_y", 0.004)
 		tape_mats.append(tm)
+		var tmi := MeshInstance3D.new()
+		tmi.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+		mi.get_parent().add_child(tmi)
+		tape_mis.append(tmi)
 		# glue makes a point stiffer (it bends less)
 		var glued := 0.0
 		var cnt := 0
@@ -841,11 +846,13 @@ func _rebuild(all := true) -> void:
 		if list.size() > 0:
 			mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, _arrays_for(list, ident, Vector3.ZERO), [], {}, CUSTOM_FMT)
 			mesh.surface_set_material(0, mat)
-			var tarr := _tape_arrays(q)
-			if tarr.size() > 0:
-				mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, tarr)
-				mesh.surface_set_material(1, tape_mats[q])
 		pockets[q].mesh = mesh
+		var tmesh := ArrayMesh.new()
+		var tarr := _tape_arrays(q) if list.size() > 0 else []
+		if tarr.size() > 0:
+			tmesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, tarr)
+			tmesh.surface_set_material(0, tape_mats[q])
+		tape_mis[q].mesh = tmesh
 		_update_hitbox(q, list)
 		for att in atts:
 			if att.hp > 0 and att.q == q and calive[att.c] == 0:

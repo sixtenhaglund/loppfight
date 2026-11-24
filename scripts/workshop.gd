@@ -163,7 +163,7 @@ func _refresh() -> void:
 	info.text = {
 		"draw": "Draw on your lopp with markers. Hold LEFT mouse and paint.  Right-drag / A D = turn,  wheel = zoom",
 		"erase": "Erase your drawing.",
-		"tape": "TAPE: press on the paper and drag. The tape follows your mouse over the folds. 2 coins per bit. Taped paper almost can't rip.",
+		"tape": "TAPE: press where it starts, drag to where it ends: one straight strip that wraps over the folds. 2 coins per bit. Taped paper almost can't rip.",
 		"glue": "GLUE: paint glue on. It dries stiff and shiny: tougher paper that bends less. 1 coin per dab.",
 		"shield": "SHIELD: 6 sheets of paper glued together. Click to stick it on, R = rotate. It catches hits until it crumples and falls off. 60 coins.",
 		"rod": "PAPER ROD: rolled-up paper glued on. Smash and bash hit harder. Click to stick it on, R = rotate. 40 coins.",
@@ -376,8 +376,10 @@ func _drag() -> void:
 			for i in range(1, steps + 1):
 				main.player.paint_at(last_pos.lerp(h.pos, float(i) / steps), brush, color, tool == "erase")
 			last_pos = h.pos
-		"tape", "glue":
-			var step := 0.1 if tool == "tape" else 0.09
+		"tape":
+			_straight_tape(h)
+		"glue":
+			var step := 0.09
 			var last: Vector3 = stroke[-1]
 			if last.distance_to(h.pos) < step:
 				return
@@ -389,6 +391,37 @@ func _drag() -> void:
 			stroke_n.append(h.normal)
 			_draw_preview()
 			coins_lbl.text = "%d coins  (-%d)" % [Game.coins, _stroke_cost()]
+
+
+## Tape comes off the roll STRAIGHT: one strip from where you pressed to where the mouse is now.
+## We walk along that straight line and press every bit down onto the paper (shooting a ray at the
+## paper from outside), so the strip still wraps over folds instead of floating through the air.
+func _straight_tape(h: Dictionary) -> void:
+	var a: Vector3 = stroke[0]
+	var na: Vector3 = stroke_n[0]
+	var b: Vector3 = h.pos
+	var press_dir := -(na + (h.normal as Vector3)).normalized()
+	if press_dir.length() < 0.1:
+		press_dir = -na
+	var xf: Transform3D = main.player.global_transform * Transform3D(Basis(), LoppScript.VIS_OFF)
+	var bits := maxi(1, int(ceilf(a.distance_to(b) / 0.1)))
+	var max_bits := Game.coins / Game.PRICES.tape
+	var pts := [a]
+	var ns := [na]
+	for i in range(1, mini(bits, max_bits) + 1):
+		var s := a.lerp(b, float(i) / bits)
+		var from: Vector3 = xf * (s - press_dir * 0.6)
+		var hit: Dictionary = main.player.pick(from, (xf.basis * press_dir).normalized())
+		if hit.is_empty():
+			continue
+		pts.append(hit.pos)
+		ns.append(hit.normal)
+	stroke = pts
+	stroke_n = ns
+	if bits > max_bits:
+		info.text = "Not enough coins for a longer strip!"
+	_draw_preview()
+	coins_lbl.text = "%d coins  (-%d)" % [Game.coins, _stroke_cost()]
 
 
 func _stroke_cost() -> int:
