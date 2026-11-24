@@ -466,8 +466,8 @@ func apply_graphics() -> void:
 	vp.scaling_3d_scale = [0.75, 1.0, 1.0][q]   # Low draws the 3D in fewer pixels
 
 
-## Paper scraps that have landed and stopped moving get frozen and stop colliding: they still lie
-## on the desk, but the physics engine doesn't have to think about them any more.
+## Paper scraps that have landed and stopped moving get frozen: the physics engine stops simulating
+## them until a lopp comes close again.
 var settle_t := 0.0
 
 
@@ -477,13 +477,21 @@ func _settle_debris(delta: float) -> void:
 		return
 	settle_t = 0.5
 	for rb in debris:
-		if not is_instance_valid(rb) or rb.freeze:
+		if not is_instance_valid(rb):
+			continue
+		if rb.freeze:
+			# a lopp is coming: wake the scrap up so it gets pushed around instead of walked through
+			for l in [player, cpu]:
+				var d: Vector3 = rb.global_position - l.global_position
+				if Vector2(d.x, d.z).length() < 1.9:
+					rb.freeze = false
+					rb.set_meta("born", t)
+					rb.set_process(true)
+					break
 			continue
 		var age: float = t - float(rb.get_meta("born", t))
 		if rb.sleeping or (age > 2.5 and rb.linear_velocity.length() < 0.08 and rb.angular_velocity.length() < 0.3):
-			rb.freeze = true
-			rb.collision_layer = 0
-			rb.collision_mask = 0
+			rb.freeze = true   # still solid, but the physics engine stops simulating it
 
 
 # ================================================================ game flow

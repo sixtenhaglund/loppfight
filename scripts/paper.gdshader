@@ -17,6 +17,12 @@ uniform float flutter = 0.0;
 uniform vec3 piece_n = vec3(0.0, 1.0, 0.0);
 uniform vec3 piece_axis = vec3(1.0, 0.0, 0.0);
 uniform float phase = 0.0;
+// ---- jaws + desk ----
+uniform float jaw = 0.0;             // jaw opening angle for this point
+uniform float hinge_z0 = -0.5;       // depth of the back fold line in the middle (the back tip)
+uniform float hinge_z1 = -0.05;      // ... and out at the sides
+uniform float floor_y = -1000.0;     // desk height: paper can lie on it but never go through
+uniform vec4 desk = vec4(-15.0, 15.0, -8.0, 8.0);   // desk edges (x min, x max, z min, z max)
 uniform float web = 0.0;           // 1 = simple web renderer: matte paper, almost no bumps
 
 varying vec2 extra;                // x = ambient occlusion (crevices), y = marker amount
@@ -26,7 +32,10 @@ vec3 rot3(vec3 v, vec3 ax, float a) {
 }
 
 void vertex() {
-	extra = UV2;
+	// UV2.x = darkness + 2 * (hinge weight * 50), so unpack both
+	float hw_i = floor(UV2.x / 2.0);
+	extra = vec2(UV2.x - hw_i * 2.0, UV2.y);
+	float hinge = hw_i / 50.0;
 	// COLOR.a = how far out along the point: the base stays put, beyond the fold it curves around
 	float ang = length(bend_rot);
 	if (ang > 0.0001) {
@@ -34,6 +43,17 @@ void vertex() {
 		vec3 ax = bend_rot / ang;
 		VERTEX = pivot + rot3(VERTEX - pivot, ax, ang * s);
 		NORMAL = rot3(NORMAL, ax, ang * s);
+	}
+	// the jaws open by BENDING the paper: the middle fold stays put, paper further away turns more
+	// (the fold line runs from the back tip out to the side corners, so its depth depends on x)
+	if (jaw != 0.0) {
+		vec3 xa = vec3(1.0, 0.0, 0.0);
+		float hz = mix(hinge_z0, hinge_z1, clamp(abs(VERTEX.x), 0.0, 1.0));
+		float hd = length(vec2(VERTEX.y, VERTEX.z - hz));
+		float a = jaw * smoothstep(0.03, 0.45, hd);
+		vec3 piv = vec3(0.0, 0.0, hz);
+		VERTEX = piv + rot3(VERTEX - piv, xa, a);
+		NORMAL = rot3(NORMAL, xa, a);
 	}
 	// torn pieces: curl like a scrap of paper, ripple while flying
 	if (curl != 0.0 || flutter != 0.0) {
@@ -45,6 +65,14 @@ void vertex() {
 		VERTEX += piece_n * h;
 		float side = sign(dot(NORMAL, piece_n));
 		NORMAL = normalize(NORMAL - piece_axis * dh * side);
+	}
+	// lie on the desk, never through it
+	if (floor_y > -999.0) {
+		vec4 wp = MODEL_MATRIX * vec4(VERTEX, 1.0);
+		if (wp.y < floor_y && wp.x > desk.x && wp.x < desk.y && wp.z > desk.z && wp.z < desk.w) {
+			wp.y = floor_y;
+			VERTEX = (inverse(MODEL_MATRIX) * wp).xyz;
+		}
 	}
 }
 
