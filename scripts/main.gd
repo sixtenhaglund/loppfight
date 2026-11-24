@@ -1,5 +1,5 @@
 extends Node3D
-## LOPPS - main scene: builds the desk, the light, the camera, the two lopps and the HUD.
+## LOPP FIGHT - main scene: builds the desk, the light, the camera, the two lopps and the HUD.
 
 const LoppScript := preload("res://scripts/lopp.gd")
 const DEBRIS_MAX := 160

@@ -1,4 +1,4 @@
-"""LOPPS - every sound in the game, cut + remixed ONLY from Sixten's own recordings in assets/sounds/his/.
+"""LOPP FIGHT - every sound in the game, cut + remixed ONLY from Sixten's own recordings in assets/sounds/his/.
 Nothing is synthesized: no noise, no sine waves. Only slicing, pitching (resampling), filtering, layering and gain.
 
   "C:/Program Files/Blender Foundation/Blender 5.1/blender.exe" -b --python tools/make_sounds.py
