@@ -5,6 +5,7 @@ extends RigidBody3D
 
 var nrm_local := Vector3.UP   # which way the flat side faces (in the piece's own space)
 var cells := 1
+var mat: ShaderMaterial      # its own material, so it can ripple on its own
 
 
 func _ready() -> void:
@@ -25,3 +26,13 @@ func _integrate_forces(st: PhysicsDirectBodyState3D) -> void:
 	st.apply_central_force(-n * vn * absf(vn) * k)
 	# air also tips the piece so it rocks back and forth (falling-leaf motion)
 	st.apply_torque(n.cross(v.normalized()) * vn * k * 0.05)
+
+
+func _process(_delta: float) -> void:
+	if mat == null:
+		return
+	if freeze:
+		mat.set_shader_parameter("flutter", 0.0)   # landed: keep the curl, stop rippling
+		set_process(false)
+		return
+	mat.set_shader_parameter("flutter", clampf(linear_velocity.length() * 0.012, 0.0, 0.05))

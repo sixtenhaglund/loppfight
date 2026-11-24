@@ -23,7 +23,8 @@ const S := 1.0            # half the width (the lopp is 2 units wide, about 8 cm
 const DEPTH := 1.15       # how far the points stick out (about as tall as they are wide, like a real one)
 var SUB := 9              # each paper face is cut into SUB*SUB cells (set from the graphics setting)
 const THICK := 0.026      # paper thickness you see on cut/torn edges
-const VIS_OFF := Vector3(0, 0, -DEPTH * 0.5)
+const HZ := -0.3           # the fold-in-half line sticks out at the back (it is also the jaw hinge)
+const VIS_OFF := Vector3(0, 0, -(DEPTH + HZ) * 0.5)
 
 const HOP_SPEED := 3.2
 const HOP_UP := 3.4
@@ -125,6 +126,10 @@ var tips: Array = []            # rest position of each point's tip
 var pocket_mats: Array = []     # one material per point, so each can bend on its own
 var bend: Array = [Vector3.ZERO, Vector3.ZERO, Vector3.ZERO, Vector3.ZERO]
 var bend_v: Array = [Vector3.ZERO, Vector3.ZERO, Vector3.ZERO, Vector3.ZERO]
+var bend_set: Array = [Vector3.ZERO, Vector3.ZERO, Vector3.ZERO, Vector3.ZERO]   # permanent folds from hard hits
+var fold_at: Array = [0.25, 0.25, 0.25, 0.25]  # where along the point it bends (0 = base, 1 = tip)
+var bend_rot: Array = [Vector3.ZERO, Vector3.ZERO, Vector3.ZERO, Vector3.ZERO]
+var base_c: Array = []           # middle of the square under each point
 var stiff: Array = []           # hand-folded: some points are softer than others
 var last_vel := Vector3.ZERO
 var last_yaw := 0.0
@@ -149,7 +154,7 @@ func _ready() -> void:
 	physics_material_override = pm
 	var cs := CollisionShape3D.new()
 	var box := BoxShape3D.new()
-	box.size = Vector3(2 * S, 2 * S, DEPTH)
+	box.size = Vector3(2 * S, 2 * S, DEPTH - HZ)
 	cs.shape = box
 	add_child(cs)
 
@@ -160,11 +165,14 @@ func _ready() -> void:
 	jaw_lo = MeshInstance3D.new()
 	visual.add_child(jaw_up)
 	visual.add_child(jaw_lo)
+	jaw_up.position = Vector3(0, 0, HZ)   # jaws turn around the middle fold line
+	jaw_lo.position = Vector3(0, 0, HZ)
 	_make_materials()
 	_build_paper()
 	for q in 4:
 		var mi := MeshInstance3D.new()
 		(jaw_up if q % 2 == 1 else jaw_lo).add_child(mi)   # q = 1,3 are the upper points
+		mi.position = Vector3(0, 0, -HZ)
 		pockets.append(mi)
 		var pmat: ShaderMaterial = mat.duplicate()
 		pocket_mats.append(pmat)
@@ -189,10 +197,12 @@ func _build_paper() -> void:
 			var part := 0 if sy > 0 else 1
 			# hand folded = never perfect: the corners and the bottom edge are a bit off.
 			# Corners shared by two points must move the same way, so _corner() remembers them.
-			var c0 := Vector3(0, 0, 0)
-			var c1 := _corner(Vector3(sx * S, 0, 0), true)
+			# the middle fold line (c0-c1) sticks out at the back, like a real lopp folded in half
+			var c0 := Vector3(0, 0, HZ)
+			var c1 := _corner(Vector3(sx * S, 0, HZ), true)
 			var c2 := _corner(Vector3(sx * S, sy * S, 0), false)
-			var c3 := _corner(Vector3(0, sy * S, 0), false)
+			var c3 := _corner(Vector3(0, sy * S, HZ * 0.45), false)
+			base_c.append((c0 + c1 + c2 + c3) / 4.0)
 			# the tip sits above the middle of its own square (each point is its own pyramid)
 			var tip := Vector3(sx * S * randf_range(0.44, 0.56), sy * S * randf_range(0.44, 0.56), DEPTH * randf_range(0.93, 1.05))
 			tips.append(tip)
@@ -201,8 +211,15 @@ func _build_paper() -> void:
 			var outer := {"bow": randf_range(0.035, 0.06), "col": col, "marker": 0.93, "lift_opp": -1, "lift": Vector3.ZERO}
 			var inner := {"bow": randf_range(0.01, 0.025), "col": Color.WHITE, "marker": 0.0, "lift_opp": -1, "lift": Vector3.ZERO}
 			# outside of the point: one square folded along the diagonal (c2 -> tip)
-			_add_face(c1, c2, tip, part, (c1 + c2 + tip) / 3.0 - inside, 0, q, outer)
-			_add_face(c2, c3, tip, part, (c2 + c3 + tip) / 3.0 - inside, 0, q, outer)
+			# the pocket opening flares out and curls back a little (bent paper, not a cut edge)
+			var outer_a: Dictionary = outer.duplicate()
+			outer_a.lift_opp = 2
+			outer_a.lift = Vector3(sx * randf_range(0.04, 0.09), 0, -randf_range(0.03, 0.08))
+			var outer_b: Dictionary = outer.duplicate()
+			outer_b.lift_opp = 2
+			outer_b.lift = Vector3(0, sy * randf_range(0.04, 0.09), -randf_range(0.03, 0.08))
+			_add_face(c1, c2, tip, part, (c1 + c2 + tip) / 3.0 - inside, 0, q, outer_a)
+			_add_face(c2, c3, tip, part, (c2 + c3 + tip) / 3.0 - inside, 0, q, outer_b)
 			# inside of the mouth (the walls between the points)
 			_add_face(c0, c1, tip, part, (c0 + c1 + tip) / 3.0 - inside, 1, q, inner)
 			_add_face(c3, c0, tip, part, (c3 + c0 + tip) / 3.0 - inside, 1, q, inner)
@@ -219,7 +236,7 @@ func _build_paper() -> void:
 	wave.frequency = 0.9
 	for i in cv.size():
 		var g := gpos[cgid[i]]
-		var keep := clampf((absf(g.y) + absf(g.z)) / 0.25, 0.0, 1.0)   # stay put on the hinge
+		var keep := clampf((absf(g.y) + absf(g.z - HZ)) / 0.25, 0.0, 1.0)   # stay put on the hinge
 		cdisp[i] = Vector3(wave.get_noise_3dv(g), wave.get_noise_3dv(g + Vector3(31, 0, 0)), wave.get_noise_3dv(g + Vector3(0, 47, 0))) * 0.03 * keep
 
 
@@ -416,7 +433,7 @@ func _edge_free(c: int, k: int) -> bool:
 
 
 ## Turns a list of cells into mesh arrays. xfs = transform for each jaw part, center is subtracted.
-func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3) -> Array:
+func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3, bent := false) -> Array:
 	var cnt := cells.size()
 	var pos := PackedVector3Array()
 	pos.resize(cnt * 3)
@@ -426,9 +443,12 @@ func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3) -> Array:
 	acc.resize(nvid)
 	for idx in cnt:
 		var c := cells[idx]
-		var xf: Transform3D = xfs[cpart[c]]
+		var xf: Transform3D = xfs[cquad[c]]
 		for k in 3:
-			pos[idx * 3 + k] = xf * (cv[c * 3 + k] + cdisp[c * 3 + k] + coff[c * 3 + k]) - center
+			var p := cv[c * 3 + k] + cdisp[c * 3 + k] + coff[c * 3 + k]
+			if bent:
+				p = _bent(cquad[c], p, cv[c * 3 + k].z)
+			pos[idx * 3 + k] = xf * p - center
 		var nn := (pos[idx * 3 + 1] - pos[idx * 3]).cross(pos[idx * 3 + 2] - pos[idx * 3]).normalized()
 		fn[idx] = nn
 		for k in 3:
@@ -523,7 +543,7 @@ func _rebuild(all := true) -> void:
 	dirty = false
 	var t0 := Time.get_ticks_usec()
 	_corner_offsets()
-	var ident := [Transform3D.IDENTITY, Transform3D.IDENTITY]
+	var ident := [Transform3D.IDENTITY, Transform3D.IDENTITY, Transform3D.IDENTITY, Transform3D.IDENTITY]
 	for q in 4:
 		if dirty_q & (1 << q) == 0:
 			continue
@@ -649,6 +669,7 @@ func receive_hit(gpoint: Vector3, gsource: Vector3, power: float, radius: float,
 	state = "stun"
 	stun_t = 0.2 + 0.12 * power
 	kick_points(push, 2.5 * power, lp)
+	fold_points(push, power, lp)
 	if main:
 		main.paper_bits(gpoint, -(global_transform.basis * push), 18 + int(power * 14))
 		if lost > 30:
@@ -775,26 +796,34 @@ func _detach_loose(push: Vector3) -> int:
 func _spawn_debris(list: PackedInt32Array, push: Vector3) -> void:
 	if main == null:
 		return
-	var xfs := [jaw_up.global_transform, jaw_lo.global_transform]
+	var xfs := [pockets[0].global_transform, pockets[1].global_transform, pockets[2].global_transform, pockets[3].global_transform]
 	if list.size() < 4:   # crumbs: just fibres flying off, no physics object
-		main.paper_bits(xfs[cpart[list[0]]] * ccen[list[0]], global_transform.basis * push, 3)
+		main.paper_bits(xfs[cquad[list[0]]] * ccen[list[0]], global_transform.basis * push, 3)
 		return
 	_corner_offsets()
 	var center := Vector3.ZERO
 	var avg_n := Vector3.ZERO
 	for c in list:
-		var xf: Transform3D = xfs[cpart[c]]
-		center += xf * (ccen[c] + ccurl[c])
+		var xf: Transform3D = xfs[cquad[c]]
+		center += xf * _bent(cquad[c], ccen[c] + ccurl[c], ccen[c].z)
 		avg_n += xf.basis * cnorm[c]
 	center /= list.size()
-	var arr := _arrays_for(list, xfs, center)
+	var arr := _arrays_for(list, xfs, center, true)
 	var mesh := ArrayMesh.new()
 	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
-	mesh.surface_set_material(0, mat_debris)
+	var pmat: ShaderMaterial = mat_debris.duplicate()
+	var pn := avg_n.normalized() if avg_n.length() > 0.01 else Vector3.UP
+	var pax := pn.cross(Vector3.UP if absf(pn.y) < 0.9 else Vector3.RIGHT).normalized()
+	pmat.set_shader_parameter("piece_n", pn)
+	pmat.set_shader_parameter("piece_axis", pax)
+	pmat.set_shader_parameter("curl", randf_range(0.25, 0.9) * (1.0 if randf() < 0.5 else -1.0))   # torn paper curls up
+	pmat.set_shader_parameter("phase", randf() * TAU)
+	mesh.surface_set_material(0, pmat)
 	var aabb := mesh.get_aabb()
 
 	var rb = PaperPiece.new()
 	rb.cells = list.size()
+	rb.mat = pmat
 	rb.nrm_local = avg_n.normalized() if avg_n.length() > 0.01 else Vector3.UP
 	var mi := MeshInstance3D.new()
 	mi.mesh = mesh
@@ -1041,14 +1070,52 @@ func _flop(delta: float) -> void:
 		var tipv: Vector3 = tips[q]
 		# the body moved, the soft tips get left behind; turning swings them sideways
 		bend_v[q] += -dv * 0.32 + Vector3(-dyaw * tipv.z * 1.4, 0, 0)
-		var f: Vector3 = -bend[q] * kq - bend_v[q] * 4.5 + down * kq * 0.045   # spring + damping + droop
+		var f: Vector3 = -(bend[q] - bend_set[q]) * kq - bend_v[q] * 4.5 + down * kq * 0.045   # spring + damping + droop
 		bend_v[q] += f * delta
-		bend[q] = (bend[q] + bend_v[q] * delta).limit_length(0.45)
+		bend[q] = (bend[q] + bend_v[q] * delta).limit_length(1.3)
 		var jaw: Node3D = pockets[q].get_parent()
-		pocket_mats[q].set_shader_parameter("bend", jaw.transform.basis.inverse() * bend[q])
+		_update_fold(q, jaw.transform.basis.inverse() * bend[q])
 	squash_v += (-squash * 260.0 - squash_v * 10.0) * delta
 	squash += squash_v * delta
 	visual.scale = Vector3(1.0 - squash * 0.5, 1.0 + squash, 1.0 - squash * 0.5)
+
+
+## Paper bends, it doesn't slide: turn the tip movement into a rotation around a spot along the point
+## (pivot). Everything beyond the pivot curves around it - more and more towards the tip.
+func _update_fold(q: int, tip_move: Vector3) -> void:
+	var b: Vector3 = base_c[q]
+	var tip: Vector3 = tips[q]
+	var pivot := b.lerp(tip, fold_at[q])
+	var arm := tip - pivot
+	var rot := arm.normalized().cross(tip_move) / maxf(arm.length(), 0.2)
+	bend_rot[q] = rot
+	pocket_mats[q].set_shader_parameter("bend_rot", rot)
+	pocket_mats[q].set_shader_parameter("pivot", pivot)
+	pocket_mats[q].set_shader_parameter("fold_start", fold_at[q])
+
+
+## Same bend as the shader does, for when a bent piece tears off (so it doesn't jump)
+func _bent(q: int, p: Vector3, rest_z: float) -> Vector3:
+	var rot: Vector3 = bend_rot[q]
+	var ang := rot.length()
+	if ang < 0.0001:
+		return p
+	var s := smoothstep(fold_at[q], 1.0, clampf(rest_z / DEPTH, 0.0, 1.0))
+	var pivot: Vector3 = (base_c[q] as Vector3).lerp(tips[q], fold_at[q])
+	return pivot + (p - pivot).rotated(rot / ang, ang * s)
+
+
+## A hard hit leaves a permanent fold where it landed
+func fold_points(push: Vector3, power: float, near: Vector3) -> void:
+	for q in 4:
+		var f := clampf(1.2 - (tips[q] as Vector3).distance_to(near) / 1.4, 0.0, 1.0)
+		var amount := power * f - 0.8
+		if amount <= 0.0:
+			continue
+		var axis: Vector3 = ((tips[q] as Vector3) - (base_c[q] as Vector3)).normalized()
+		var side := push - axis * push.dot(axis)            # only the sideways part folds it
+		bend_set[q] = ((bend_set[q] as Vector3) + side * amount * 0.32).limit_length(0.75)
+		fold_at[q] = lerpf(fold_at[q], clampf(near.z / DEPTH - 0.15, 0.1, 0.75), 0.6)   # crease where it was hit
 
 
 func kick_points(dir: Vector3, amount: float, near := Vector3.INF) -> void:
