@@ -22,7 +22,7 @@ const PaperShader := preload("res://scripts/paper.gdshader")
 const S := 1.0            # half the width (the lopp is 2 units wide, about 8 cm in real life)
 const DEPTH := 1.05       # how far the points stick out
 const SUB := 9            # each paper face is cut into SUB*SUB cells
-const THICK := 0.018      # paper thickness you see on cut/torn edges
+const THICK := 0.026      # paper thickness you see on cut/torn edges
 const VIS_OFF := Vector3(0, 0, -DEPTH * 0.5)
 
 const HOP_SPEED := 3.2
@@ -111,6 +111,11 @@ var ai_t := 0.0
 var ai_strafe := 1.0
 var ai_charge_goal := 0.4
 var dirty := false
+var dirty_q := 0             # which of the 4 points need a new mesh (bit per point)
+var pockets: Array = []       # one mesh per point, so a bite only rebuilds what it touched
+var coff := PackedVector3Array()   # cached peel offsets (see _corner_offsets)
+var torn_g := {}              # points in space that touch a rip
+var snaps_since_check := 0    # no snapped bonds = nothing can have come loose
 var _ground := false
 
 
@@ -143,6 +148,12 @@ func _ready() -> void:
 	visual.add_child(jaw_lo)
 	_make_materials()
 	_build_paper()
+	for q in 4:
+		var mi := MeshInstance3D.new()
+		(jaw_up if q % 2 == 1 else jaw_lo).add_child(mi)   # q = 1,3 are the upper points
+		pockets.append(mi)
+	coff.resize(ncells * 3)
+	dirty_q = 15
 	_rebuild()
 
 
@@ -157,11 +168,12 @@ func _build_paper() -> void:
 	for sx in [-1.0, 1.0]:
 		for sy in [-1.0, 1.0]:
 			var part := 0 if sy > 0 else 1
+			# hand folded = never perfect: the corners and the bottom edge are a bit off.
+			# Corners shared by two points must move the same way, so _corner() remembers them.
 			var c0 := Vector3(0, 0, 0)
-			var c1 := Vector3(sx * S, 0, 0)
-			var c2 := Vector3(sx * S, sy * S, 0)
-			var c3 := Vector3(0, sy * S, 0)
-			# hand folded = never perfect: every tip is a bit off
+			var c1 := _corner(Vector3(sx * S, 0, 0), true)
+			var c2 := _corner(Vector3(sx * S, sy * S, 0), false)
+			var c3 := _corner(Vector3(0, sy * S, 0), false)
 			var tip := Vector3(sx * randf_range(0.04, 0.1), sy * randf_range(0.04, 0.1), DEPTH * randf_range(0.95, 1.04))
 			var inside := Vector3(sx * S * 0.35, sy * S * 0.35, DEPTH * 0.25)
 			var col: Color = pal[q]
@@ -170,20 +182,39 @@ func _build_paper() -> void:
 			# outside of the point: one square folded along the diagonal (c2 -> tip)
 			_add_face(c1, c2, tip, part, (c1 + c2 + tip) / 3.0 - inside, 0, q, outer)
 			_add_face(c2, c3, tip, part, (c2 + c3 + tip) / 3.0 - inside, 0, q, outer)
-			# inside of the mouth (the slits between the points)
+			# inside of the mouth (the walls between the points)
 			_add_face(c0, c1, tip, part, (c0 + c1 + tip) / 3.0 - inside, 1, q, inner)
 			_add_face(c3, c0, tip, part, (c3 + c0 + tip) / 3.0 - inside, 1, q, inner)
-			# back: a finger pocket = two flaps with a slit between them (c1 -> c3) that bulges open
-			var back_in := {"bow": 0.0, "col": Color.WHITE, "marker": 0.0, "lift_opp": 0, "lift": Vector3(0, 0, 0.035)}
-			var back_out := {"bow": 0.0, "col": Color.WHITE, "marker": 0.0, "lift_opp": 0, "lift": Vector3(0, 0, -0.06)}
-			_add_face(c0, c1, c3, part, Vector3(0, 0, -1), 2, q, back_in)
-			_add_face(c2, c1, c3, part, Vector3(0, 0, -1), 2, q, back_out)
+			# NO back: like a real lopp, the underside is 4 open finger pockets (the hollow points)
 			q += 1
 	ncells = calive.size()
 	cdisp.resize(cv.size())
 	ccurl.resize(ncells)
 	cdmg.resize(ncells)
 	_build_bonds()
+	# real paper is never perfectly flat: a gentle wave over the whole sheet (same for shared points)
+	var wave := FastNoiseLite.new()
+	wave.seed = randi()
+	wave.frequency = 0.9
+	for i in cv.size():
+		var g := gpos[cgid[i]]
+		var keep := clampf((absf(g.y) + absf(g.z)) / 0.25, 0.0, 1.0)   # stay put on the hinge
+		cdisp[i] = Vector3(wave.get_noise_3dv(g), wave.get_noise_3dv(g + Vector3(31, 0, 0)), wave.get_noise_3dv(g + Vector3(0, 47, 0))) * 0.03 * keep
+
+
+var _corners := {}
+
+
+func _corner(p: Vector3, on_hinge: bool) -> Vector3:
+	var key := Vector3i(roundi(p.x * 10), roundi(p.y * 10), 0)
+	if not _corners.has(key):
+		var j := Vector3(randf_range(-0.05, 0.05), 0.0 if on_hinge else randf_range(-0.05, 0.05), randf_range(-0.07, 0.05))
+		if p.x == 0.0:
+			j.x = 0.0
+		if on_hinge:
+			j.z = 0.0   # the hinge line has to stay straight or the jaws pull apart
+		_corners[key] = p + j
+	return _corners[key]
 
 
 func _add_face(p0: Vector3, p1: Vector3, p2: Vector3, part: int, outward: Vector3, kind: int, quad: int, o: Dictionary) -> void:
@@ -244,7 +275,7 @@ func _add_cell(a: Array, b: Array, c: Array, part: int, face_id: int, kind: int,
 		cao.append(v[2])
 		cmark.append(v[3])
 		cvid.append(v[4])
-		ccol.append(col)
+		ccol.append(Color(col.r, col.g, col.b, clampf(v[0].z / DEPTH, 0.0, 1.0)))
 	cpart.append(part)
 	cface.append(face_id)
 	ckind.append(kind)
@@ -347,7 +378,8 @@ func _make_materials() -> void:
 	mat.set_shader_parameter("paper_tex", ImageTexture.create_from_image(img))
 	mat.set_shader_parameter("fiber_normal", nt)
 	mat.set_shader_parameter("mottle", mt)
-	mat.set_shader_parameter("inside_dark", 0.42)
+	mat.set_shader_parameter("inside_dark", 0.6)
+	mat.set_shader_parameter("web", 1.0 if RenderingServer.get_current_rendering_method() == "gl_compatibility" else 0.0)
 	mat_debris = mat.duplicate()
 	mat_debris.set_shader_parameter("inside_dark", 0.85)
 
@@ -365,7 +397,6 @@ func _edge_free(c: int, k: int) -> bool:
 ## Turns a list of cells into mesh arrays. xfs = transform for each jaw part, center is subtracted.
 func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3) -> Array:
 	var cnt := cells.size()
-	var coff := _corner_offsets()
 	var pos := PackedVector3Array()
 	pos.resize(cnt * 3)
 	var fn := PackedVector3Array()
@@ -391,13 +422,15 @@ func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3) -> Array:
 		var torn := false
 		var dshade := 1.0 - clampf(cdmg[c] * 0.12, 0.0, 0.28)
 		# Godot treats clockwise triangles as the front, so add them 0, 2, 1
-		for k in [0, 2, 1]:
+		for kk in 3:
+			var k := kk if kk == 0 else 3 - kk
+			var vi := c * 3 + k
 			verts.append(pos[idx * 3 + k])
-			var sn: Vector3 = acc[cvid[c * 3 + k]]
+			var sn: Vector3 = acc[cvid[vi]]
 			norms.append(fn[idx] if torn or sn.length_squared() < 0.0001 else sn.normalized())
-			uvs.append(cuv[c * 3 + k])
-			uv2s.append(Vector2(cao[c * 3 + k] * dshade, cmark[c * 3 + k]))
-			cols.append(ccol[c * 3 + k])
+			uvs.append(cuv[vi])
+			uv2s.append(Vector2(cao[vi] * dshade, cmark[vi]))
+			cols.append(ccol[vi])
 		# paper thickness on every edge that is cut or torn: a thin white strip
 		var cen := (pos[idx * 3] + pos[idx * 3 + 1] + pos[idx * 3 + 2]) / 3.0
 		for k in 3:
@@ -419,7 +452,7 @@ func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3) -> Array:
 					norms.append(outn)
 					uvs.append(cuv[c * 3 + k])
 					uv2s.append(Vector2(1.05, 0.0))
-					cols.append(Color.WHITE)
+					cols.append(Color(1, 1, 1, 0))
 	var arr := []
 	arr.resize(Mesh.ARRAY_MAX)
 	arr[Mesh.ARRAY_VERTEX] = verts
@@ -433,18 +466,10 @@ func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3) -> Array:
 ## How far each cell corner peels up. Cells that are still glued together around a point all get the
 ## SAME offset there (so paper that is in one piece stays in one piece), but cells on different
 ## sides of a rip get different offsets - that is what opens the rip without making spiky teeth.
-func _corner_offsets() -> PackedVector3Array:
-	var off := PackedVector3Array()
-	off.resize(ncells * 3)
-	for g in gpos.size():
+func _corner_offsets() -> void:
+	var off := coff
+	for g in torn_g:
 		var corners: PackedInt32Array = gid_corners[g]
-		var any := false
-		for ci in corners:
-			if ccurl[ci / 3] != Vector3.ZERO:
-				any = true
-				break
-		if not any:
-			continue
 		# group the cells around this point that are still connected to each other here
 		var group := {}
 		for ci in corners:
@@ -464,7 +489,6 @@ func _corner_offsets() -> PackedVector3Array:
 		for ci in corners:
 			var r: int = _root(group, ci / 3)
 			off[ci] = sum[r] / cnt[r]
-	return off
 
 
 func _root(group: Dictionary, x: int) -> int:
@@ -473,23 +497,35 @@ func _root(group: Dictionary, x: int) -> int:
 	return x
 
 
-func _rebuild() -> void:
+func _rebuild(all := true) -> void:
 	dirty = false
-	var jaws := [jaw_up, jaw_lo]
+	var t0 := Time.get_ticks_usec()
+	_corner_offsets()
 	var ident := [Transform3D.IDENTITY, Transform3D.IDENTITY]
-	for part in 2:
+	for q in 4:
+		if dirty_q & (1 << q) == 0:
+			continue
+		dirty_q &= ~(1 << q)
 		var list := PackedInt32Array()
 		for c in ncells:
-			if calive[c] == 1 and cpart[c] == part:
+			if calive[c] == 1 and cquad[c] == q:
 				list.append(c)
 		var mesh := ArrayMesh.new()
 		if list.size() > 0:
 			mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, _arrays_for(list, ident, Vector3.ZERO))
 			mesh.surface_set_material(0, mat)
-		jaws[part].mesh = mesh
+		pockets[q].mesh = mesh
+		if not all:
+			break
+	if main:
+		main.perf_note("rebuild", Time.get_ticks_usec() - t0)
 
 
 # ================================================================ damage
+func _touch(c: int) -> void:
+	dirty_q |= 1 << cquad[c]
+
+
 func _add_dent(center: Vector3, r: float, d: Vector3) -> void:
 	var dl := d.length()
 	var off := Vector3(randf() * 50, randf() * 50, randf() * 50)
@@ -502,6 +538,7 @@ func _add_dent(center: Vector3, r: float, d: Vector3) -> void:
 			var p := v * 3.6 + off
 			var nz := Vector3(noise.get_noise_3dv(p), noise.get_noise_3dv(p + Vector3(19, 7, 3)), noise.get_noise_3dv(p + Vector3(5, 23, 11)))
 			cdisp[i] += d * f + nz * dl * 1.1 * f
+			dirty_q |= 1 << cquad[i / 3]
 
 
 ## Called by the attacker. Returns false if the hit missed (we were dodging).
@@ -509,6 +546,7 @@ func _add_dent(center: Vector3, r: float, d: Vector3) -> void:
 func receive_hit(gpoint: Vector3, gsource: Vector3, power: float, radius: float, kind: String, hp_dmg: float, knock: Vector3, tear: float) -> bool:
 	if dead or invuln_t > 0.0:
 		return false
+	var t0 := Time.get_ticks_usec()
 	var lp := to_local(gpoint) - VIS_OFF
 	var ls := to_local(gsource) - VIS_OFF
 	var push := lp - ls
@@ -522,6 +560,7 @@ func receive_hit(gpoint: Vector3, gsource: Vector3, power: float, radius: float,
 		var d := ccen[c].distance_to(lp)
 		if d < radius:
 			cdmg[c] += power * (1.0 - d / radius) * randf_range(0.7, 1.3)
+			_touch(c)
 
 	if kind == "smash":
 		_add_dent(lp, radius * 1.5, push * 0.3 * power)
@@ -529,7 +568,14 @@ func receive_hit(gpoint: Vector3, gsource: Vector3, power: float, radius: float,
 		_add_dent(lp, radius * 1.1, push * 0.12 * power)
 
 	var snapped := PackedInt32Array()
-	for bi in nbonds:
+	# only bonds next to damaged cells can snap
+	var near := {}
+	for c in ncells:
+		if calive[c] == 1 and cdmg[c] >= 0.5:
+			for k in 3:
+				for bi in cedge[c * 3 + k]:
+					near[bi] = true
+	for bi in near:
 		if bond_ok[bi] == 0:
 			continue
 		var a := bond_a[bi]
@@ -577,11 +623,12 @@ func receive_hit(gpoint: Vector3, gsource: Vector3, power: float, radius: float,
 		open_target = 0.0
 	state = "stun"
 	stun_t = 0.2 + 0.12 * power
-	dirty = true
 	if main:
 		main.paper_bits(gpoint, -(global_transform.basis * push), 18 + int(power * 14))
 		if lost > 30:
 			main.sfx("rip", gpoint, 2.0)
+	if main:
+		main.perf_note("hit", Time.get_ticks_usec() - t0)
 	if hp <= 0.0:
 		_die("destroyed")
 	return true
@@ -589,6 +636,11 @@ func receive_hit(gpoint: Vector3, gsource: Vector3, power: float, radius: float,
 
 func _break_bond(bi: int) -> void:
 	bond_ok[bi] = 0
+	snaps_since_check += 1
+	for g in [bond_g1[bi], bond_g2[bi]]:
+		torn_g[g] = true
+		for ci in gid_corners[g]:
+			dirty_q |= 1 << cquad[ci / 3]
 	var lift := randf_range(0.01, 0.05)   # torn edges peel up a bit, one side more than the other
 	for c in [bond_a[bi], bond_b[bi]]:
 		ccurl[c] += cnorm[c] * lift + Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)) * 0.006
@@ -632,6 +684,9 @@ func _run_tear(bi: int, steps: int, from: Vector3) -> void:
 
 ## Finds pieces that are not connected to the biggest piece any more and turns them into debris.
 func _detach_loose(push: Vector3) -> int:
+	if snaps_since_check == 0:
+		return 0
+	snaps_since_check = 0
 	# loose teeth along a rip (a torn cell hanging on by a single edge) get pulled off as fibres
 	var crumbs := 0
 	for pass_i in 2:
@@ -644,6 +699,7 @@ func _detach_loose(push: Vector3) -> int:
 					links += 1
 			if links <= 1:
 				calive[c] = 0
+				_touch(c)
 				crumbs += 1
 				if main and crumbs % 4 == 1:
 					main.paper_bits(to_global(ccen[c] + VIS_OFF), global_transform.basis * push, 2)
@@ -684,6 +740,7 @@ func _detach_loose(push: Vector3) -> int:
 		lost += comps[i].size()
 		for c in comps[i]:
 			calive[c] = 0
+			_touch(c)
 	return lost
 
 
@@ -694,6 +751,7 @@ func _spawn_debris(list: PackedInt32Array, push: Vector3) -> void:
 	if list.size() < 4:   # crumbs: just fibres flying off, no physics object
 		main.paper_bits(xfs[cpart[list[0]]] * ccen[list[0]], global_transform.basis * push, 3)
 		return
+	_corner_offsets()
 	var center := Vector3.ZERO
 	var avg_n := Vector3.ZERO
 	for c in list:
@@ -739,6 +797,7 @@ func _die(reason: String) -> void:
 		if bond_ok[bi] == 1 and (randf() < 0.12 or (cface[bond_a[bi]] != cface[bond_b[bi]] and randf() < 0.45)):
 			_break_bond(bi)
 	_detach_loose(Vector3(0, 0.5, 1))
+	dirty_q = 15
 	_rebuild()
 	axis_lock_angular_x = false
 	axis_lock_angular_z = false
@@ -928,8 +987,8 @@ func _process(delta: float) -> void:
 	visual.rotation = Vector3(pitch + lean.x, 0, lean.y)
 	shake = maxf(0.0, shake - delta * 0.8)
 	visual.position = VIS_OFF + Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)) * shake * 0.4
-	if dirty:
-		_rebuild()
+	if dirty_q != 0:
+		_rebuild(false)   # spread the work: one point per frame
 
 
 func _facing_enemy() -> float:
@@ -970,7 +1029,6 @@ func _smash_land() -> void:
 				main.on_hit(self, enemy, 1.0)
 	# slamming face-first into things crumples your own front a little too
 	_add_dent(Vector3(0, -S * 0.3, DEPTH), 0.6, Vector3(0, 0.03, -0.06))
-	dirty = true
 	if not hit:
 		state = "stun"
 		stun_t = 0.4

@@ -47,6 +47,7 @@ func _ready() -> void:
 	cpu.died.connect(_on_died)
 	_camera()
 	_hud()
+	paper_bits(Vector3(0, -60, 0), Vector3.UP, 1)   # warm-up: prepares the fibre graphics before the first hit
 	if shooting:
 		autotest = true
 		player.is_ai = true
@@ -129,6 +130,14 @@ func add_debris(rb: RigidBody3D, pos: Vector3) -> void:
 
 
 var bit_mesh: QuadMesh
+var perf := {}
+
+
+func perf_note(what: String, usec: int) -> void:
+	var p: Array = perf.get(what, [0, 0, 0])
+	perf[what] = [p[0] + 1, p[1] + usec, maxi(p[2], usec)]
+
+
 
 
 ## Little paper fibres and crumbs that fly out of a hit.
@@ -210,6 +219,9 @@ func _environment() -> void:
 	# black. There we add soft extra light instead.
 	if RenderingServer.get_current_rendering_method() == "gl_compatibility":
 		env.ambient_light_energy = 2.2
+		env.reflected_light_source = Environment.REFLECTION_SOURCE_DISABLED   # no mirror-like shine on the web
+		sun.shadow_bias = 0.15          # thin paper confuses web shadows ("shadow acne"), so keep a safety gap
+		sun.shadow_normal_bias = 3.0
 		var fill := DirectionalLight3D.new()
 		fill.rotation_degrees = Vector3(-25, 35 + 180, 0)
 		fill.light_energy = 0.75
@@ -241,6 +253,8 @@ func _desk() -> void:
 	wood.roughness_texture = load("res://assets/textures/desk_rough.jpg")
 	wood.albedo_color = Color(0.78, 0.72, 0.66)   # less orange
 	wood.metallic_specular = 0.25                 # less plastic shine
+	if RenderingServer.get_current_rendering_method() == "gl_compatibility":
+		wood.albedo_color = Color(0.6, 0.55, 0.52)   # the web renderer shows colours stronger
 	wood.uv1_triplanar = true
 	wood.uv1_scale = Vector3(0.05, 0.05, 0.05)
 	wood.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC
@@ -526,7 +540,9 @@ func _process(delta: float) -> void:
 				" hits ", hits, " debris ", debris.size(), " fps ", Engine.get_frames_per_second(),
 				" | P ", player.state, " ", player.global_position.snappedf(0.1), " C ", cpu.state, " ", cpu.global_position.snappedf(0.1),
 				" cells ", player.calive.count(1), "/", cpu.calive.count(1))
-		if (state == "over" and now > ko_until + 500) or t > 60.0:
+		if not shooting and ((state == "over" and now > ko_until + 500) or t > 60.0):
+			for k in perf:
+				print("PERF ", k, ": ", perf[k][0], " times, avg ", perf[k][1] / perf[k][0] / 1000.0, " ms, max ", perf[k][2] / 1000.0, " ms")
 			print("AUTOTEST DONE t=", snappedf(t, 0.1), " hp ", snappedf(player.hp, 0.1), "/", snappedf(cpu.hp, 0.1), " hits ", hits, " debris ", debris.size())
 			get_tree().quit()
 
