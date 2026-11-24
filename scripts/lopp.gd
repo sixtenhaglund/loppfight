@@ -18,6 +18,7 @@ signal died(lopp, reason)
 
 const PaperPiece := preload("res://scripts/paper_piece.gd")
 const PaperShader := preload("res://scripts/paper.gdshader")
+const TapeShader := preload("res://scripts/tape.gdshader")
 
 const S := 1.0            # half the width (the lopp is 2 units wide, about 8 cm in real life)
 const DEPTH := 1.15       # how far the points stick out (about as tall as they are wide, like a real one)
@@ -37,6 +38,12 @@ const PALETTES := [
 ]
 
 var is_ai := false
+# ---- upgrades (set by main before the lopp is added) ----
+var loadout := {}               # tapes, glue, shields, rods, layer, teeth (see Game.gd)
+var paint_img: Image            # your drawing (one picture, every face has its own square in it)
+var lopp_seed := 0              # same seed = same hand-folded shape every time
+var workshop := false           # standing still in the workshop: no wobble, straight tips
+var max_hp := 100.0
 var ai_level := 1          # 0 easy, 1 normal, 2 hard
 var active := false
 var paper_kind := 0        # 0 = math paper (squares), 1 = lined paper
@@ -69,6 +76,21 @@ var cnorm := PackedVector3Array()
 var ccurl := PackedVector3Array()
 var ncells := 0
 var nfaces := 0
+var catlas := PackedVector2Array()  # per vertex: where it is in your drawing
+var clayer := PackedByteArray()     # 0 = the lopp itself, 1 = the extra layer glued on top
+var cover := PackedInt32Array()     # cell -> the extra-layer cell covering it (or -1)
+var ctape := PackedByteArray()      # 1 = tape is stuck on this cell
+var cglue := PackedFloat32Array()   # 0..1 dried glue on this cell
+var face_p: Array = []              # corners of every face of the first layer (for drawing)
+var tape_bind: Array = []           # per tape: [[cell, b0, b1, b2], ...] where its points sit
+var tape_mats: Array = []
+var atts: Array = []                # shields, paper rods, paper teeth
+var paint_tex: ImageTexture
+var paint_dirty := false
+var paint_wait := 0.0
+const LAYER_GAP := 0.025
+const TAPE_HALF := 0.075            # tape is about 6 mm wide in real life
+const CUSTOM_FMT := Mesh.ARRAY_CUSTOM_RGBA_FLOAT << Mesh.ARRAY_FORMAT_CUSTOM0_SHIFT
 # ---- bonds ----
 var bond_a := PackedInt32Array()
 var bond_b := PackedInt32Array()
@@ -149,6 +171,8 @@ var was_ground := true
 
 
 func _ready() -> void:
+	if lopp_seed != 0:
+		seed(lopp_seed)   # your lopp keeps its hand-folded shape
 	noise.seed = randi()
 	noise.frequency = 1.0
 	noise.fractal_type = FastNoiseLite.FRACTAL_RIDGED   # ridges = sharp crumple creases
@@ -180,8 +204,13 @@ func _ready() -> void:
 	_make_materials()
 	_make_contact_shadow()
 	_build_paper()
+	_apply_loadout()
+	max_hp = 100.0 + (40.0 if loadout.get("layer", false) else 0.0)
+	hp = max_hp
 	# real paper tips never stand perfectly straight: each one is folded over a little
 	for q in 4:
+		if workshop:
+			break
 		var axis: Vector3 = ((tips[q] as Vector3) - (base_c[q] as Vector3)).normalized()
 		var r := Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1))
 		var perp := axis.cross(r).normalized()
@@ -194,12 +223,26 @@ func _ready() -> void:
 		pockets.append(mi)
 		var pmat: ShaderMaterial = mat.duplicate()
 		pocket_mats.append(pmat)
-		mi.material_override = pmat
-		stiff.append(randf_range(90.0, 170.0))
+		var tm := ShaderMaterial.new()
+		tm.shader = TapeShader
+		tm.set_shader_parameter("wrinkle", mat.get_shader_parameter("mottle"))
+		tm.set_shader_parameter("floor_y", 0.004)
+		tape_mats.append(tm)
+		# glue makes a point stiffer (it bends less)
+		var glued := 0.0
+		var cnt := 0
+		for c in ncells:
+			if cquad[c] == q:
+				glued += cglue[c]
+				cnt += 1
+		stiff.append(randf_range(90.0, 170.0) * (1.0 + 2.5 * glued / maxf(cnt, 1)))
 	last_yaw = global_rotation.y
 	coff.resize(ncells * 3)
 	dirty_q = 15
 	_rebuild()
+	_make_attachments()
+	if lopp_seed != 0:
+		randomize()
 
 
 # ================================================================ building the paper
@@ -246,6 +289,8 @@ func _build_paper() -> void:
 			_add_face(c3, c0, tip, part, (c3 + c0 + tip) / 3.0 - inside, 1, q, inner)
 			# NO back: like a real lopp, the underside is 4 open finger pockets (the hollow points)
 			q += 1
+	if loadout.get("layer", false):
+		_add_extra_layer()
 	ncells = calive.size()
 	cdisp.resize(cv.size())
 	ccurl.resize(ncells)
@@ -259,6 +304,140 @@ func _build_paper() -> void:
 		var g := gpos[cgid[i]]
 		var keep := clampf(absf(g.y) / 0.25, 0.0, 1.0)   # stay put on the middle fold
 		cdisp[i] = Vector3(wave.get_noise_3dv(g), wave.get_noise_3dv(g + Vector3(31, 0, 0)), wave.get_noise_3dv(g + Vector3(0, 47, 0))) * 0.012 * keep
+
+
+## EXTRA LAYER: a second sheet glued over the outside of every point. It is its own paper (its own
+## bonds), so it rips and falls off on its own, and the lopp under it takes much less damage.
+func _add_extra_layer() -> void:
+	var n0 := calive.size()
+	var nvid0 := nvid
+	var face0 := nfaces
+	var acc := {}   # average outward direction at every spot (so shared corners move the same way)
+	for c in n0:
+		if ckind[c] == 0:
+			for k in 3:
+				var key := Vector3i(roundi(cv[c * 3 + k].x * 1000), roundi(cv[c * 3 + k].y * 1000), roundi(cv[c * 3 + k].z * 1000))
+				acc[key] = acc.get(key, Vector3.ZERO) + cnorm[c]
+	cover.resize(n0)
+	cover.fill(-1)
+	for c in n0:
+		if ckind[c] != 0:
+			continue
+		cover[c] = calive.size()
+		var cen := Vector3.ZERO
+		for k in 3:
+			var i := c * 3 + k
+			var key := Vector3i(roundi(cv[i].x * 1000), roundi(cv[i].y * 1000), roundi(cv[i].z * 1000))
+			var p: Vector3 = cv[i] + (acc[key] as Vector3).normalized() * LAYER_GAP
+			cv.append(p)
+			cen += p
+			cuv.append(cuv[i])
+			cao.append(cao[i])
+			cmark.append(cmark[i])
+			cmark[i] = 0.0       # the colours are on the new outside sheet; underneath is plain paper
+			chw.append(chw[i])
+			cvid.append(cvid[i] + nvid0)
+			catlas.append(catlas[i])
+			ccol.append(ccol[i])
+		clayer.append(1)
+		cpart.append(cpart[c])
+		cface.append(cface[c] + face0)
+		ckind.append(0)
+		cquad.append(cquad[c])
+		calive.append(1)
+		ccen.append(cen / 3.0)
+		cnorm.append(cnorm[c])
+	nvid += nvid0
+	nfaces += face0
+	cover.resize(calive.size())
+	for c in range(n0, calive.size()):
+		cover[c] = -1
+
+
+## Tape and glue: find which cells they are stuck on, and make those much harder to tear
+func _apply_loadout() -> void:
+	ctape.resize(ncells)
+	cglue.resize(ncells)
+	if cover.size() < ncells:
+		var old := cover.size()
+		cover.resize(ncells)
+		for c in range(old, ncells):
+			cover[c] = -1
+	for pts in loadout.get("tapes", []):
+		var bind := []
+		for p in pts:
+			var c := closest_cell(p)
+			if c >= 0:
+				bind.append([c] + _bary(c, p))
+		tape_bind.append(bind)
+		for i in range(pts.size() - 1):
+			var a: Vector3 = pts[i]
+			var b: Vector3 = pts[i + 1]
+			for c in ncells:
+				if Geometry3D.get_closest_point_to_segment(ccen[c], a, b).distance_to(ccen[c]) < TAPE_HALF + 0.03:
+					ctape[c] = 1
+	for g in loadout.get("glue", []):
+		for c in ncells:
+			var d := ccen[c].distance_to(g)
+			if d < 0.2:
+				cglue[c] = minf(1.0, cglue[c] + 0.9 * (1.0 - d / 0.2) + 0.2)
+	for bi in nbonds:
+		var a := bond_a[bi]
+		var b := bond_b[bi]
+		if ctape[a] == 1 or ctape[b] == 1:
+			bond_str[bi] *= 6.0                                   # tape holds the paper together
+		else:
+			bond_str[bi] *= 1.0 + 1.6 * maxf(cglue[a], cglue[b])  # dried glue makes it tougher
+
+
+## The cell closest to a spot (outside sheet first, if there is an extra layer)
+func closest_cell(p: Vector3) -> int:
+	var best := -1
+	var bd := INF
+	for c in ncells:
+		if calive[c] == 0:
+			continue
+		if c < cover.size() and cover[c] >= 0 and calive[cover[c]] == 1:
+			continue   # covered by the extra layer
+		var d := ccen[c].distance_squared_to(p)
+		if d < bd:
+			bd = d
+			best = c
+	return best
+
+
+## Where p sits inside triangle c, as 3 weights (one per corner)
+func _bary(c: int, p: Vector3) -> Array:
+	var a := cv[c * 3]
+	var b := cv[c * 3 + 1]
+	var d := cv[c * 3 + 2]
+	var v0 := b - a
+	var v1 := d - a
+	var v2 := p - a
+	var d00 := v0.dot(v0)
+	var d01 := v0.dot(v1)
+	var d11 := v1.dot(v1)
+	var d20 := v2.dot(v0)
+	var d21 := v2.dot(v1)
+	var den := d00 * d11 - d01 * d01
+	if absf(den) < 0.000001:
+		return [0.34, 0.33, 0.33]
+	var v := clampf((d11 * d20 - d01 * d21) / den, 0.0, 1.0)
+	var w := clampf((d00 * d21 - d01 * d20) / den, 0.0, 1.0)
+	var s := v + w
+	if s > 1.0:
+		v /= s
+		w /= s
+	return [1.0 - v - w, v, w]
+
+
+func _bind_pos(bd: Array) -> Vector3:
+	var c: int = bd[0]
+	var p := Vector3.ZERO
+	for k in 3:
+		var i := c * 3 + k
+		p += (cv[i] + cdisp[i] + coff[i]) * float(bd[1 + k])
+	return p + cnorm[c] * 0.007
 
 
 var _corners := {}
@@ -289,6 +468,10 @@ func _add_face(p0: Vector3, p1: Vector3, p2: Vector3, part: int, outward: Vector
 		lab = [0, 2, 1]
 	var t := (p1 - p0).normalized()
 	var bt := n.cross(t)
+	face_p.append([p0, p1, p2])
+	var tile := face_id % 16
+	var tx := float(tile % 4)
+	var ty := float(tile / 4)
 	var e1 := (p1 - p0) / SUB
 	var e2 := (p2 - p0) / SUB
 	var grid := {}
@@ -318,7 +501,8 @@ func _add_face(p0: Vector3, p1: Vector3, p2: Vector3, part: int, outward: Vector
 					ao = 0.45 + 0.45 * clampf(p.z / DEPTH, 0.0, 1.0)
 				2:
 					ao = 0.93 - 0.5 * liftw
-			grid[Vector2i(i, j)] = [p, Vector2((p - p0).dot(t), (p - p0).dot(bt)) * 0.5, ao, mark, nvid]
+			var atlas := Vector2((tx + 0.02 + 0.96 * w[1]) / 4.0, (ty + 0.02 + 0.96 * w[2]) / 4.0)
+			grid[Vector2i(i, j)] = [p, Vector2((p - p0).dot(t), (p - p0).dot(bt)) * 0.5, ao, mark, nvid, atlas]
 			nvid += 1
 	for i in SUB:
 		for j in SUB - i:
@@ -335,7 +519,9 @@ func _add_cell(a: Array, b: Array, c: Array, part: int, face_id: int, kind: int,
 		cmark.append(v[3])
 		chw.append(smoothstep(0.0, 0.35, absf((v[0] as Vector3).y)))
 		cvid.append(v[4])
+		catlas.append(v[5])
 		ccol.append(Color(col.r, col.g, col.b, clampf(v[0].z / DEPTH, 0.0, 1.0)))
+	clayer.append(0)
 	cpart.append(part)
 	cface.append(face_id)
 	ckind.append(kind)
@@ -439,6 +625,9 @@ func _make_materials() -> void:
 	mat.set_shader_parameter("fiber_normal", nt)
 	mat.set_shader_parameter("mottle", mt)
 	mat.set_shader_parameter("inside_dark", 0.6)
+	if paint_img:
+		paint_tex = ImageTexture.create_from_image(paint_img)
+		mat.set_shader_parameter("paint_tex", paint_tex)
 	mat.set_shader_parameter("web", 1.0 if RenderingServer.get_current_rendering_method() == "gl_compatibility" else 0.0)
 	mat.set_shader_parameter("floor_y", 0.004)
 	mat_debris = mat.duplicate()
@@ -481,6 +670,7 @@ func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3, bent := f
 	var uvs := PackedVector2Array()
 	var uv2s := PackedVector2Array()
 	var cols := PackedColorArray()
+	var cust := PackedFloat32Array()
 	for idx in cnt:
 		var c := cells[idx]
 		var torn := cdmg[c] > 0.35   # crumpled paper = flat facets with sharp creases
@@ -495,6 +685,7 @@ func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3, bent := f
 			uvs.append(cuv[vi])
 			uv2s.append(Vector2(cao[vi] * dshade + _hw_pack(vi), cmark[vi]))
 			cols.append(ccol[vi])
+			cust.append_array([catlas[vi].x, catlas[vi].y, cglue[c], 0.0])
 		# paper thickness on every edge that is cut or torn: a thin white strip
 		var cen := (pos[idx * 3] + pos[idx * 3 + 1] + pos[idx * 3 + 2]) / 3.0
 		for k in 3:
@@ -529,6 +720,7 @@ func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3, bent := f
 						uvs.append(cuv[c * 3 + k])
 						uv2s.append(Vector2(1.08 + _hw_pack(c * 3 + k), 0.0))
 						cols.append(Color(1, 1, 1, da))
+						cust.append_array([0.0, 0.0, 0.0, 0.0])
 			for tri in [[a, b, b + off], [a, b + off, a + off]]:
 				var p0: Vector3 = tri[0]
 				var p1: Vector3 = tri[1]
@@ -540,6 +732,7 @@ func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3, bent := f
 					uvs.append(cuv[c * 3 + k])
 					uv2s.append(Vector2(1.05 + _hw_pack(c * 3 + k), 0.0))
 					cols.append(Color(1, 1, 1, clampf(p.z / DEPTH, 0.0, 1.0)))
+					cust.append_array([0.0, 0.0, 0.0, 0.0])
 	var arr := []
 	arr.resize(Mesh.ARRAY_MAX)
 	arr[Mesh.ARRAY_VERTEX] = verts
@@ -547,6 +740,7 @@ func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3, bent := f
 	arr[Mesh.ARRAY_TEX_UV] = uvs
 	arr[Mesh.ARRAY_TEX_UV2] = uv2s
 	arr[Mesh.ARRAY_COLOR] = cols
+	arr[Mesh.ARRAY_CUSTOM0] = cust
 	return arr
 
 
@@ -585,6 +779,46 @@ func _root(group: Dictionary, x: int) -> int:
 	return x
 
 
+## The tape strips stuck on point q: flat ribbons that follow the paper (cell by cell)
+func _tape_arrays(q: int) -> Array:
+	var verts := PackedVector3Array()
+	var norms := PackedVector3Array()
+	var uvs := PackedVector2Array()
+	var cols := PackedColorArray()
+	for bind in tape_bind:
+		var along := 0.0
+		for i in range(bind.size() - 1):
+			var b0: Array = bind[i]
+			var b1: Array = bind[i + 1]
+			var c0: int = b0[0]
+			var c1: int = b1[0]
+			if calive[c0] == 0 or calive[c1] == 0 or cquad[c0] != q:
+				continue   # torn away with the paper under it
+			var p0 := _bind_pos(b0)
+			var p1 := _bind_pos(b1)
+			var n := (cnorm[c0] + cnorm[c1]).normalized()
+			var side := (p1 - p0).cross(n).normalized() * TAPE_HALF
+			var seg := p0.distance_to(p1)
+			var quad := [[p0 + side, Vector2(along, 0)], [p0 - side, Vector2(along, 1)], [p1 + side, Vector2(along + seg, 0)],
+				[p1 - side, Vector2(along + seg, 1)]]
+			for k in [0, 2, 1, 1, 2, 3]:
+				var p: Vector3 = quad[k][0]
+				verts.append(p)
+				norms.append(n)
+				uvs.append(quad[k][1])
+				cols.append(Color(1, 1, 1, clampf(p.z / DEPTH, 0.0, 1.0)))
+			along += seg
+	if verts.is_empty():
+		return []
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = verts
+	arr[Mesh.ARRAY_NORMAL] = norms
+	arr[Mesh.ARRAY_TEX_UV] = uvs
+	arr[Mesh.ARRAY_COLOR] = cols
+	return arr
+
+
 ## UV2.x carries two numbers: the darkness (0..1.1) and, in steps of 2, the jaw hinge weight
 func _hw_pack(vi: int) -> float:
 	return 2.0 * floorf(chw[vi] * 50.0)
@@ -605,10 +839,17 @@ func _rebuild(all := true) -> void:
 				list.append(c)
 		var mesh := ArrayMesh.new()
 		if list.size() > 0:
-			mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, _arrays_for(list, ident, Vector3.ZERO))
+			mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, _arrays_for(list, ident, Vector3.ZERO), [], {}, CUSTOM_FMT)
 			mesh.surface_set_material(0, mat)
+			var tarr := _tape_arrays(q)
+			if tarr.size() > 0:
+				mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, tarr)
+				mesh.surface_set_material(1, tape_mats[q])
 		pockets[q].mesh = mesh
 		_update_hitbox(q, list)
+		for att in atts:
+			if att.hp > 0 and att.q == q and calive[att.c] == 0:
+				_drop_att(att)   # the paper it was glued to is gone
 		if not all:
 			break
 	if main:
@@ -672,13 +913,39 @@ func receive_hit(gpoint: Vector3, gsource: Vector3, power: float, radius: float,
 		push = Vector3(0, 0, -1)
 	push = push.normalized()
 
+	# a shield or paper rod in the way takes the hit first
+	for att in atts:
+		if att.hp <= 0 or att.kind == "tooth":
+			continue
+		if (att.p as Vector3).distance_to(lp) < (0.85 if att.kind == "shield" else 0.5):
+			att.hp -= hp_dmg + power * 8.0
+			_crumple_att(att, power)
+			if main:
+				main.sfx("crumple", gpoint, -2.0)
+			var keep: float = 0.25 if att.kind == "shield" else 0.6
+			power *= keep
+			hp_dmg *= keep
+			tear *= 0.0 if att.kind == "shield" else 0.5
+			if att.hp <= 0:
+				_drop_att(att)
+			break
+	var prot_sum := 0.0
+	var prot_n := 0
 	for c in ncells:
 		if calive[c] == 0:
 			continue
 		var d := ccen[c].distance_to(lp)
 		if d < radius:
-			cdmg[c] += power * (1.0 - d / radius) * randf_range(0.7, 1.3)
+			var mult := 0.12 if ctape[c] == 1 else 1.0      # tape: almost nothing gets through
+			mult *= 1.0 - 0.45 * cglue[c]                    # dried glue: tougher
+			if cover[c] >= 0 and calive[cover[c]] == 1:
+				mult *= 0.3                                  # still under the extra layer
+			cdmg[c] += power * (1.0 - d / radius) * randf_range(0.7, 1.3) * mult
+			prot_sum += mult
+			prot_n += 1
 			_touch(c)
+	if prot_n > 0:
+		hp_dmg *= 0.35 + 0.65 * prot_sum / prot_n
 
 	if kind == "smash":
 		_add_dent(lp, radius * 1.4, push * 0.26 * power, 0.03 * power)
@@ -834,8 +1101,8 @@ func _run_tear(bi: int, steps: int, from: Vector3) -> void:
 			if bond_ok[nb] == 0 or calive[bond_a[nb]] == 0 or calive[bond_b[nb]] == 0:
 				continue
 			var other := bond_g2[nb] if bond_g1[nb] == tip else bond_g1[nb]
-			if other == prev:
-				continue
+			if other == prev or ctape[bond_a[nb]] == 1 or ctape[bond_b[nb]] == 1:
+				continue   # a rip can't run through tape
 			var sc := (gpos[other] - gpos[tip]).normalized().dot(dir) + randf() * 0.6
 			if cface[bond_a[nb]] != cface[bond_b[nb]]:
 				sc += 0.7      # creases tear easily
@@ -937,7 +1204,7 @@ func _spawn_debris(list: PackedInt32Array, push: Vector3) -> void:
 	center /= list.size()
 	var arr := _arrays_for(list, xfs, center, true)
 	var mesh := ArrayMesh.new()
-	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+	mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr, [], {}, CUSTOM_FMT)
 	var pmat: ShaderMaterial = mat_debris.duplicate()
 	var pn := avg_n.normalized() if avg_n.length() > 0.01 else Vector3.UP
 	var pax := pn.cross(Vector3.UP if absf(pn.y) < 0.9 else Vector3.RIGHT).normalized()
@@ -1051,7 +1318,8 @@ func cmd_bash() -> void:
 func _bash_hit(to: Vector3) -> void:
 	var front := to_global(VIS_OFF + Vector3(0, 0, DEPTH * 0.6))
 	var info: Dictionary = enemy.nearest_cell(front)
-	var ok: bool = enemy.receive_hit(info.p, global_position, 1.0, 0.9, "bash", 5.0, _flat(to) * 9.5 + Vector3.UP * 3.0, 0.0)
+	var rb := 1.0 + 0.25 * _count_att("rod")
+	var ok: bool = enemy.receive_hit(info.p, global_position, rb, 0.9, "bash", 5.0 * rb, (_flat(to) * 9.5 + Vector3.UP * 3.0) * (0.8 + 0.2 * rb), 0.0)
 	if ok:
 		main.sfx("thump", info.p, 2.0)
 		main.sfx("crumple", info.p, -3.0)
@@ -1209,6 +1477,7 @@ func _process(delta: float) -> void:
 		open_v = -open_v * 0.35
 	for q in 4:
 		pocket_mats[q].set_shader_parameter("jaw", _jaw_angle(q))
+		tape_mats[q].set_shader_parameter("jaw", _jaw_angle(q))
 	if state != "smash" and state != "dead" and state != "bash":
 		pitch_target = 0.0
 	pitch = lerpf(pitch, pitch_target, 1.0 - exp(-12.0 * delta))
@@ -1219,7 +1488,15 @@ func _process(delta: float) -> void:
 	shake = maxf(0.0, shake - delta * 0.8)
 	visual.position = VIS_OFF + Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)) * shake * 0.4
 	_update_contact()
-	_flop(delta)
+	if not workshop:
+		_flop(delta)
+	_update_atts()
+	if paint_dirty:
+		paint_wait -= delta
+		if paint_wait <= 0.0:
+			paint_tex.update(paint_img)   # send the new drawing to the graphics card (max 20x per second)
+			paint_dirty = false
+			paint_wait = 0.05
 	if dirty_q != 0:
 		_rebuild(false)   # spread the work: one point per frame
 
@@ -1305,9 +1582,10 @@ func _update_fold(q: int, tip_move: Vector3) -> void:
 	var arm := tip - pivot
 	var rot := arm.normalized().cross(tip_move) / maxf(arm.length(), 0.2)
 	bend_rot[q] = rot
-	pocket_mats[q].set_shader_parameter("bend_rot", rot)
-	pocket_mats[q].set_shader_parameter("pivot", pivot)
-	pocket_mats[q].set_shader_parameter("fold_start", fold_at[q])
+	for m in [pocket_mats[q], tape_mats[q]]:
+		m.set_shader_parameter("bend_rot", rot)
+		m.set_shader_parameter("pivot", pivot)
+		m.set_shader_parameter("fold_start", fold_at[q])
 
 
 ## Same bend as the shader does, for when a bent piece tears off (so it doesn't jump)
@@ -1364,8 +1642,10 @@ func _bite_hit() -> void:
 	var info: Dictionary = enemy.nearest_cell(mouth)
 	if info.d < 0.45 + 0.35 * c and _facing_enemy() > 0.4:
 		var fwd := _flat(global_transform.basis.z)
-		var ok: bool = enemy.receive_hit(info.p, mouth, 0.8 + 1.5 * c, 0.35 + 0.25 * c, "bite", 4.0 + 9.0 * c,
-			fwd * (2.0 + 4.0 * c) + Vector3.UP * 2.0, 3.0 + 10.0 * c)
+		var teeth := _count_att("tooth")
+		var tb := 1.0 + 0.06 * teeth                 # paper teeth bite harder and rip further
+		var ok: bool = enemy.receive_hit(info.p, mouth, (0.8 + 1.5 * c) * tb, 0.35 + 0.25 * c, "bite", (4.0 + 9.0 * c) * tb,
+			fwd * (2.0 + 4.0 * c) + Vector3.UP * 2.0, 3.0 + 10.0 * c + teeth * 0.5)
 		if ok:
 			main.sfx("rip", info.p, 0.0)
 			main.on_hit(self, enemy, 0.4 + 0.6 * c)
@@ -1383,8 +1663,9 @@ func _smash_land() -> void:
 		to.y = 0
 		if to.length() < 2.1:
 			var info: Dictionary = enemy.nearest_cell(to_global(VIS_OFF + Vector3(0, -S * 0.6, DEPTH)))
-			hit = enemy.receive_hit(info.p, global_position + Vector3.UP * 1.5, 1.5, 0.8, "smash", 11.0,
-				_flat(to) * 5.0 + Vector3.UP * 4.5, 4.0)
+			var rb := 1.0 + 0.25 * _count_att("rod")      # paper rods hit harder
+			hit = enemy.receive_hit(info.p, global_position + Vector3.UP * 1.5, 1.5 * rb, 0.8, "smash", 11.0 * rb,
+				(_flat(to) * 5.0 + Vector3.UP * 4.5) * (1.0 + 0.1 * (rb - 1.0) * 4.0), 4.0)
 			if hit:
 				main.sfx("crumple", info.p, 0.0)
 				main.on_hit(self, enemy, 1.0)
@@ -1446,3 +1727,286 @@ func _ai(delta: float) -> void:
 	if absf(p.z) > lim.y:
 		mv.z -= signf(p.z) * 1.5
 	in_move = mv
+
+
+# ================================================================ drawing on your lopp
+## Paint a soft marker dot at spot p (in the lopp's own space). Every face has its own square in
+## the drawing picture; we only touch the pixels of faces near the dot.
+func paint_at(p: Vector3, r: float, col: Color, erase := false) -> void:
+	if paint_img == null:
+		return
+	var size := paint_img.get_width()
+	var tile_px := size / 4.0
+	for f in mini(16, face_p.size()):
+		var fp: Array = face_p[f]
+		var p0: Vector3 = fp[0]
+		var e1: Vector3 = fp[1] - p0
+		var e2: Vector3 = fp[2] - p0
+		var n := e1.cross(e2).normalized()
+		if absf((p - p0).dot(n)) > r + 0.05:
+			continue
+		# where is p in this face (u along e1, v along e2)?
+		var d00 := e1.dot(e1)
+		var d01 := e1.dot(e2)
+		var d11 := e2.dot(e2)
+		var v2 := p - p0
+		var den := d00 * d11 - d01 * d01
+		var u := (d11 * v2.dot(e1) - d01 * v2.dot(e2)) / den
+		var v := (d00 * v2.dot(e2) - d01 * v2.dot(e1)) / den
+		var du := r / sqrt(d00)
+		var dv := r / sqrt(d11)
+		if u < -du or v < -dv or u + v > 1.0 + du + dv:
+			continue
+		var tx := float(f % 4)
+		var ty := float(f / 4)
+		var x0 := int(((tx + 0.02 + 0.96 * clampf(u - du, 0, 1)) / 4.0) * size)
+		var x1 := int(((tx + 0.02 + 0.96 * clampf(u + du, 0, 1)) / 4.0) * size) + 1
+		var y0 := int(((ty + 0.02 + 0.96 * clampf(v - dv, 0, 1)) / 4.0) * size)
+		var y1 := int(((ty + 0.02 + 0.96 * clampf(v + dv, 0, 1)) / 4.0) * size) + 1
+		for py in range(y0, mini(y1, size)):
+			var wv := ((py + 0.5) / size * 4.0 - ty - 0.02) / 0.96
+			for px in range(x0, mini(x1, size)):
+				var wu := ((px + 0.5) / size * 4.0 - tx - 0.02) / 0.96
+				if wu + wv > 1.04:
+					continue
+				var dist := (p0 + e1 * wu + e2 * wv).distance_to(p)
+				if dist >= r:
+					continue
+				var a := clampf((1.0 - dist / r) * 2.0, 0.0, 1.0)
+				var old := paint_img.get_pixel(px, py)
+				if erase:
+					old.a = maxf(0.0, old.a - a)
+					paint_img.set_pixel(px, py, old)
+				else:
+					var nc := Color(old.r, old.g, old.b).lerp(Color(col.r, col.g, col.b), a if old.a > 0.01 else 1.0)
+					paint_img.set_pixel(px, py, Color(nc.r, nc.g, nc.b, maxf(old.a, a * 0.92)))
+	paint_dirty = true
+
+
+## Which paper is under a ray (for the workshop): returns {} or {cell, pos, normal} in lopp space
+func pick(from: Vector3, dir: Vector3) -> Dictionary:
+	var inv := (global_transform * Transform3D(Basis(), VIS_OFF)).affine_inverse()
+	var o := inv * from
+	var dd := (inv.basis * dir).normalized()
+	var best := -1
+	var bt := INF
+	var hit := Vector3.ZERO
+	for c in ncells:
+		if calive[c] == 0:
+			continue
+		var a := cv[c * 3] + cdisp[c * 3]
+		var b := cv[c * 3 + 1] + cdisp[c * 3 + 1]
+		var d := cv[c * 3 + 2] + cdisp[c * 3 + 2]
+		var r = Geometry3D.ray_intersects_triangle(o, dd, a, b, d)
+		if r != null:
+			var tt := (r as Vector3).distance_to(o)
+			if tt < bt:
+				bt = tt
+				best = c
+				hit = r
+	if best < 0:
+		return {}
+	var n := cnorm[best]
+	if n.dot(-dd) < 0.0:
+		n = -n   # we hit the back of the paper
+	return {"cell": best, "pos": hit, "normal": n}
+
+
+# ================================================================ shields, paper rods, paper teeth
+func _att_basis(n: Vector3, rot: float) -> Basis:
+	var x0 := n.cross(Vector3.UP)
+	if x0.length() < 0.1:
+		x0 = n.cross(Vector3.RIGHT)
+	var x := x0.normalized().rotated(n, rot)
+	return Basis(x, n.cross(x), n)
+
+
+static func make_att_mesh(kind: String, dent := 0.0, seed_v := 0) -> Mesh:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var nz := FastNoiseLite.new()
+	nz.seed = seed_v
+	nz.frequency = 3.0
+	if kind == "shield":
+		# 6 sheets of paper glued into a stiff plate, slightly curved, with layered edges
+		var w := 0.62
+		var h := 0.48
+		var th := 0.045
+		var nx := 8
+		var ny := 6
+		for side in [1.0, -1.0]:
+			for i in nx:
+				for j in ny:
+					var quad := []
+					for k in [[0, 0], [1, 0], [0, 1], [1, 1]]:
+						var u := float(i + k[0]) / nx
+						var v := float(j + k[1]) / ny
+						var x := (u - 0.5) * 2.0 * w
+						var y := (v - 0.5) * 2.0 * h
+						var z: float = side * th * 0.5 - 0.06 * (x * x + y * y) + dent * nz.get_noise_2d(x * 3.0, y * 3.0) * 0.6
+						quad.append([Vector3(x, y, z), Vector2(u, v)])
+					var order := [0, 1, 2, 2, 1, 3] if side > 0 else [0, 2, 1, 2, 3, 1]
+					for o in order:
+						st.set_uv(quad[o][1])
+						st.add_vertex(quad[o][0])
+		# the layered edge all the way round
+		var ring := []
+		for i in 32:
+			var a := TAU * i / 32.0
+			ring.append(Vector2(cos(a) * w * 1.0, sin(a) * h * 1.0).clamp(Vector2(-w, -h), Vector2(w, h)))
+		for i in 32:
+			var p0: Vector2 = ring[i]
+			var p1: Vector2 = ring[(i + 1) % 32]
+			var z0 := -0.06 * p0.length_squared()
+			var z1 := -0.06 * p1.length_squared()
+			var v := [Vector3(p0.x, p0.y, z0 + th * 0.5), Vector3(p1.x, p1.y, z1 + th * 0.5), Vector3(p0.x, p0.y, z0 - th * 0.5), Vector3(p1.x, p1.y, z1 - th * 0.5)]
+			for o in [0, 2, 1, 1, 2, 3]:
+				st.set_uv(Vector2(0.5, 0.5))
+				st.add_vertex(v[o])
+	elif kind == "rod":
+		# a sheet of paper rolled up tight into a stick
+		var r := 0.06
+		var l := 0.55
+		var seg := 14
+		for i in seg:
+			var a0 := TAU * i / seg
+			var a1 := TAU * (i + 1) / seg
+			for e in [[-l, l]]:
+				var v := [Vector3(e[0], cos(a0) * r, sin(a0) * r), Vector3(e[1], cos(a0) * r, sin(a0) * r),
+					Vector3(e[0], cos(a1) * r, sin(a1) * r), Vector3(e[1], cos(a1) * r, sin(a1) * r)]
+				var uv := [Vector2(0, float(i) / seg), Vector2(3, float(i) / seg), Vector2(0, float(i + 1) / seg), Vector2(3, float(i + 1) / seg)]
+				for o in [0, 1, 2, 2, 1, 3]:
+					st.set_uv(uv[o])
+					var p: Vector3 = v[o]
+					p += Vector3(0, 1, 0) * dent * nz.get_noise_1d(p.x * 2.0) * 0.3
+					st.add_vertex(p)
+	else:
+		# a little folded paper fang
+		var v := [Vector3(-0.07, 0, 0), Vector3(0.07, 0, 0), Vector3(0, 0.16, 0.02)]
+		for o in [0, 1, 2]:
+			st.set_uv(Vector2(v[o].x + 0.5, v[o].y))
+			st.add_vertex(v[o])
+	st.generate_normals()
+	return st.commit()
+
+
+static func make_att_material(kind: String) -> StandardMaterial3D:
+	var m := StandardMaterial3D.new()
+	m.cull_mode = BaseMaterial3D.CULL_DISABLED
+	m.roughness = 0.92
+	if kind == "shield":
+		m.albedo_color = Color(0.86, 0.84, 0.78)     # thick glued paper, a bit grey-brown
+	elif kind == "rod":
+		var img := Image.create(256, 64, false, Image.FORMAT_RGB8)
+		img.fill(Color(0.95, 0.94, 0.9))
+		for x in 256:   # the rolled-up edge shows as a spiral line
+			var y := int(x * 0.25) % 64
+			img.fill_rect(Rect2i(x, y, 1, 2), Color(0.7, 0.68, 0.64))
+		m.albedo_texture = ImageTexture.create_from_image(img)
+	else:
+		m.albedo_color = Color(0.97, 0.96, 0.92)
+	return m
+
+
+func _make_attachments() -> void:
+	for s in loadout.get("shields", []):
+		_add_att("shield", s[0], s[1], s[2])
+	for r in loadout.get("rods", []):
+		_add_att("rod", r[0], r[1], r[2])
+	if loadout.get("teeth", false):
+		for q in 4:
+			var tip: Vector3 = tips[q]
+			var mouth := Vector3(0, -signf(tip.y), 0)
+			for sx in [-0.13, 0.13]:
+				var p := tip + Vector3(sx, 0, -0.16)
+				_add_att("tooth", p, mouth, 0.0)
+
+
+func _add_att(kind: String, p: Vector3, n: Vector3, rot: float) -> void:
+	var c := closest_cell(p)
+	if c < 0:
+		return
+	var mi := MeshInstance3D.new()
+	mi.mesh = make_att_mesh(kind, 0.0, randi())
+	mi.material_override = make_att_material(kind)
+	visual.add_child(mi)
+	var basis := _att_basis(n, rot)
+	if kind == "tooth":
+		basis = Basis(Vector3.RIGHT, n, Vector3.RIGHT.cross(n))   # point at the other jaw
+	atts.append({"kind": kind, "p": p, "n": n, "basis": basis, "q": cquad[c], "c": c, "node": mi,
+		"hp": {"shield": 60.0, "rod": 35.0, "tooth": 15.0}[kind], "dent": 0.0, "seed": randi(),
+		"off": {"shield": 0.05, "rod": 0.07, "tooth": 0.0}[kind]})
+
+
+func _count_att(kind: String) -> int:
+	var n := 0
+	for att in atts:
+		if att.kind == kind and att.hp > 0:
+			n += 1
+	return n
+
+
+## Same bend + jaw movement as the shader, as a transform (for things glued onto a point)
+func bend_xform(q: int, p: Vector3) -> Transform3D:
+	var b := Basis()
+	var o := p
+	var rot: Vector3 = bend_rot[q]
+	var ang := rot.length()
+	if ang > 0.0001:
+		var s := smoothstep(fold_at[q], 1.0, clampf(p.z / DEPTH, 0.0, 1.0))
+		var pivot: Vector3 = (base_c[q] as Vector3).lerp(tips[q], fold_at[q])
+		var r1 := Basis(rot / ang, ang * s)
+		o = pivot + r1 * (o - pivot)
+		b = r1 * b
+	var hz := lerpf(HZ, -0.05, clampf(absf(o.x) / S, 0.0, 1.0))
+	var j := _jaw_angle(q) * smoothstep(0.03, 0.45, Vector2(o.y, o.z - hz).length())
+	if absf(j) > 0.0001:
+		var r2 := Basis(Vector3.RIGHT, j)
+		var piv := Vector3(0, 0, hz)
+		o = piv + r2 * (o - piv)
+		b = r2 * b
+	return Transform3D(b, o)
+
+
+func _update_atts() -> void:
+	for att in atts:
+		if att.hp <= 0:
+			continue
+		var xf := bend_xform(att.q, att.p)
+		att.node.transform = Transform3D(xf.basis * att.basis, xf.origin + xf.basis * (att.n * att.off))
+
+
+func _crumple_att(att: Dictionary, power: float) -> void:
+	att.dent = minf(att.dent + power * 0.06, 0.25)
+	att.node.mesh = make_att_mesh(att.kind, att.dent, att.seed)
+
+
+## A shield/rod/tooth that got destroyed (or lost the paper it was glued on) falls off for real
+func _drop_att(att: Dictionary) -> void:
+	att.hp = -1.0
+	var node: MeshInstance3D = att.node
+	if main == null or not is_instance_valid(node):
+		return
+	var gx := node.global_transform
+	var rb = PaperPiece.new()
+	var mi := MeshInstance3D.new()
+	mi.mesh = node.mesh
+	mi.material_override = node.material_override
+	rb.add_child(mi)
+	var cs := CollisionShape3D.new()
+	var shp := ConvexPolygonShape3D.new()
+	var pts := PackedVector3Array()
+	var faces: PackedVector3Array = node.mesh.get_faces()
+	for i in range(0, faces.size(), maxi(1, faces.size() / 60)):
+		pts.append(faces[i])
+	shp.points = pts
+	cs.shape = shp
+	rb.add_child(cs)
+	rb.mass = {"shield": 0.08, "rod": 0.04, "tooth": 0.006}[att.kind]
+	rb.cells = {"shield": 40, "rod": 6, "tooth": 2}[att.kind]
+	main.add_debris(rb, gx.origin)
+	rb.global_transform = gx
+	rb.linear_velocity = linear_velocity + gx.basis.z * 2.5 + Vector3.UP * 2.0
+	rb.angular_velocity = Vector3(randf_range(-6, 6), randf_range(-6, 6), randf_range(-6, 6))
+	node.queue_free()
+	main.sfx("flutter", gx.origin, -2.0)

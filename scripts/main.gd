@@ -31,6 +31,10 @@ var sun: DirectionalLight3D
 var paused := false
 var resume_block := 0      # ignore the click that pressed Resume
 var orbit := 0.0
+var workshop_mode := false
+var ws_yaw := 0.6         # workshop camera (controlled by workshop.gd)
+var ws_pitch := 0.45
+var ws_dist := 5.5
 
 
 func _ready() -> void:
@@ -47,10 +51,23 @@ func _ready() -> void:
 	var uishot := "uishot" in OS.get_cmdline_user_args()
 	if uishot and "fight" in OS.get_cmdline_user_args() and Game.mode == "menu":
 		Game.new_match()
-	menu = Game.mode == "menu" and not autotest and not shooting
-	player = _make_lopp(Vector3(0, LoppScript.S + 0.05, 3.2), PI, 0, autotest or menu)
-	cpu = _make_lopp(Vector3(0, LoppScript.S + 0.05, -3.2), 0.0, 1, true)
-	cpu.ai_level = 1 if menu else Game.difficulty
+	if autotest and "upgrades" in OS.get_cmdline_user_args():
+		Game.loadout = {"tapes": [PackedVector3Array([Vector3(0.3, 0.2, 0.7), Vector3(0.5, 0.25, 0.6), Vector3(0.7, 0.3, 0.5)])], "glue": [Vector3(-0.5, 0.5, 0.4)],
+			"shields": [[Vector3(0.5, -0.5, 0.5), Vector3(0.6, -0.6, 0.5).normalized(), 0.0]], "rods": [[Vector3(-0.5, 0.5, 0.4), Vector3(-0.6, 0.6, 0.5).normalized(), 0.5]], "layer": true, "teeth": true}
+	if uishot and "workshop" in OS.get_cmdline_user_args():
+		Game.mode = "workshop"
+		Game.coins = 999
+	# menu + workshop: YOUR lopp stands on the desk on its own
+	menu = (Game.mode == "menu" or Game.mode == "workshop") and not autotest and not shooting
+	workshop_mode = menu and Game.mode == "workshop"
+	player = _make_lopp(Vector3(0, LoppScript.S + 0.05, 0.0 if menu else 3.2), 0.6 if menu else PI, 0, autotest, _my_lopp())
+	cpu = _make_lopp(Vector3(0, LoppScript.S + 0.05, -40.0 if menu else -3.2), 0.0, 1, true, {"loadout": Game.cpu_loadout()})
+	cpu.ai_level = Game.difficulty
+	if menu:
+		player.freeze = true
+		cpu.freeze = true
+		cpu.visible = false
+		cpu.process_mode = Node.PROCESS_MODE_DISABLED
 	player.enemy = cpu
 	cpu.enemy = player
 	player.died.connect(_on_died)
@@ -60,7 +77,12 @@ func _ready() -> void:
 	ui.main = self
 	add_child(ui)
 	apply_graphics()
-	if menu:
+	if workshop_mode:
+		ui.show_screen("workshop")
+		var ws = preload("res://scripts/workshop.gd").new()
+		ws.main = self
+		add_child(ws)
+	elif menu:
 		ui.show_screen("menu")
 	else:
 		ui.show_screen("")
@@ -76,8 +98,24 @@ func _ready() -> void:
 		print("AUTOTEST: cells per lopp = ", player.ncells, ", bonds = ", player.nbonds)
 
 
-func _make_lopp(pos: Vector3, yaw: float, kind: int, ai: bool):
+func _my_lopp() -> Dictionary:
+	return {"loadout": Game.loadout, "paint_img": Game.paint, "lopp_seed": Game.lopp_seed, "workshop": workshop_mode}
+
+
+## The workshop changed something big (tape, layer...): build your lopp again with the new loadout
+func rebuild_player() -> void:
+	var old = player
+	player = _make_lopp(old.position, old.rotation.y, 0, false, _my_lopp())
+	player.freeze = true
+	player.enemy = cpu
+	cpu.enemy = player
+	old.queue_free()
+
+
+func _make_lopp(pos: Vector3, yaw: float, kind: int, ai: bool, extra := {}):
 	var l = LoppScript.new()
+	for k in extra:
+		l.set(k, extra[k])
 	l.paper_kind = kind
 	l.SUB = Game.paper_detail()
 	l.is_ai = ai
@@ -503,13 +541,19 @@ func _camera() -> void:
 
 
 func _update_camera(delta: float) -> void:
+	if workshop_mode:
+		var c: Vector3 = player.global_position
+		var want_w := c + Vector3(sin(ws_yaw) * cos(ws_pitch), sin(ws_pitch), cos(ws_yaw) * cos(ws_pitch)) * ws_dist
+		cam.global_position = cam.global_position.lerp(want_w, 1.0 - exp(-10.0 * delta))
+		cam.look_at(c + Vector3(-0.9, 0, 0).rotated(Vector3.UP, ws_yaw))   # lopp a bit right: the tools are on the left
+		cam_attr.dof_blur_far_distance = ws_dist + 3.0
+		return
 	if menu:
-		orbit += delta * 0.12
-		var mid: Vector3 = (player.global_position + cpu.global_position) * 0.5
-		mid.y = 0.8
-		var want_m := mid + Vector3(sin(orbit) * 7.5, 3.2, cos(orbit) * 7.5)
+		orbit += delta * 0.15   # slowly walk around YOUR lopp
+		var mid: Vector3 = player.global_position
+		var want_m := mid + Vector3(sin(orbit) * 5.5, 2.6, cos(orbit) * 5.5)
 		cam.global_position = cam.global_position.lerp(want_m, 1.0 - exp(-2.0 * delta))
-		cam.look_at(mid + Vector3(-1.2, 0, 0).rotated(Vector3.UP, orbit))   # aim a bit off-centre: the menu is on the left
+		cam.look_at(mid + Vector3(-1.6, 0, 0).rotated(Vector3.UP, orbit))   # aim off-centre: the menu is on the left
 		cam_attr.dof_blur_far_distance = cam.global_position.distance_to(mid) + 3.0
 		return
 	var p: Vector3 = player.global_position
@@ -584,6 +628,11 @@ func start_match() -> void:
 	_reload()
 
 
+func to_workshop() -> void:
+	Game.mode = "workshop"
+	_reload()
+
+
 func to_menu() -> void:
 	Game.mode = "menu"
 	_reload()
@@ -630,6 +679,15 @@ func _on_died(l, reason: String) -> void:
 		return
 	var winner := 1 if l == player else 0
 	Game.wins[winner] += 1
+	# coins: for winning, and for every bit of damage you did
+	var earned := int((cpu.max_hp - maxf(cpu.hp, 0.0)) / 4.0)
+	if winner == 0:
+		earned += 20
+		if Game.wins[0] >= Game.WINS_NEEDED:
+			earned += 60
+	Game.coins += earned
+	Game.save_lopp()
+	ui.coins_popup(earned)
 	if reason == "fell":
 		ui.say("OFF THE DESK!", 1.6)
 	else:
@@ -656,7 +714,7 @@ func _process(delta: float) -> void:
 	else:
 		Engine.time_scale = 1.0
 
-	if state == "intro" and not shooting and t > (0.3 if autotest or menu else 1.4):
+	if state == "intro" and not shooting and not menu and t > (0.3 if autotest else 1.4):
 		state = "fight"
 		if not menu and not autotest:
 			ui.say("FIGHT!", 0.5)
@@ -745,7 +803,33 @@ func _uishots() -> void:
 	DirAccess.make_dir_recursive_absolute(dir)
 	var tm := get_tree().create_timer(3.0, true, false, true)
 	await tm.timeout
-	if menu:
+	if workshop_mode:
+		# try every upgrade, then take pictures
+		var p = player
+		var line := []
+		for i in 9:
+			var c: int = p.closest_cell(p.tips[1].lerp(p.base_c[3], float(i) / 8.0) + Vector3(0, 0.15, 0.1))
+			line.append(p.ccen[c])
+		Game.loadout.tapes = [PackedVector3Array(line)]
+		Game.loadout.glue = [p.ccen[p.closest_cell(p.tips[2] + Vector3(0, -0.3, -0.3))]]
+		var sc: int = p.closest_cell(p.base_c[0] + Vector3(-0.3, -0.2, 0.25))
+		Game.loadout.shields = [[p.ccen[sc], p.cnorm[sc], 0.4]]
+		var rc: int = p.closest_cell(p.base_c[3] + Vector3(0.3, 0.2, 0.2))
+		Game.loadout.rods = [[p.ccen[rc], p.cnorm[rc], 0.8]]
+		Game.loadout.teeth = true
+		Game.loadout.layer = "layer" in OS.get_cmdline_user_args()
+		rebuild_player()
+		await get_tree().process_frame
+		for i in 40:
+			var a := float(i) / 40.0 * TAU
+			var oc: int = player.closest_cell(player.base_c[3] + Vector3(0.55, 0.45, 0.15))
+			player.paint_at(player.ccen[oc] + Vector3(0, cos(a) * 0.22, sin(a) * 0.22), 0.05, Color(0.85, 0.1, 0.1))
+		await get_tree().create_timer(1.0, true, false, true).timeout
+		get_viewport().get_texture().get_image().save_png(dir + "/ui_workshop.png")
+		ws_yaw += 2.4
+		await get_tree().create_timer(1.0, true, false, true).timeout
+		get_viewport().get_texture().get_image().save_png(dir + "/ui_workshop2.png")
+	elif menu:
 		get_viewport().get_texture().get_image().save_png(dir + "/ui_menu.png")
 		ui.show_screen("settings")
 		await get_tree().create_timer(0.5, true, false, true).timeout

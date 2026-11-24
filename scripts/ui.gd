@@ -250,9 +250,20 @@ func _build_menu() -> void:
 	fight.add_theme_font_override("font", MARKER)
 	fight.add_theme_font_size_override("font_size", 40)
 	v.add_child(fight)
+	v.add_child(_button("My lopp  (draw + upgrades)", func(): main.to_workshop()))
 	buttons["difficulty"] = _button("", _on_difficulty)
 	v.add_child(buttons["difficulty"])
 	v.add_child(_button("How to play", func(): show_screen("howto")))
+	buttons["coins"] = Label.new()
+	buttons["coins"].add_theme_font_override("font", MARKER)
+	buttons["coins"].add_theme_font_size_override("font_size", 34)
+	_outline(buttons["coins"], 10)
+	holder.add_child(buttons["coins"])
+	buttons["coins"].set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	buttons["coins"].offset_left = -320
+	buttons["coins"].offset_top = 24
+	buttons["coins"].offset_right = -30
+	buttons["coins"].horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	v.add_child(_button("Settings", _open_settings.bind("menu")))
 	if not Game.is_web():
 		v.add_child(_button("Quit", func(): get_tree().quit()))
@@ -343,7 +354,7 @@ func _build_match_over() -> void:
 
 func show_match_over(you_won: bool) -> void:
 	buttons["over_title"].text = "YOU WIN THE MATCH!" if you_won else "THE CPU WINS..."
-	buttons["over_score"].text = "%d - %d" % [Game.wins[0], Game.wins[1]]
+	buttons["over_score"].text = "%d - %d\nYou have %d coins" % [Game.wins[0], Game.wins[1], Game.coins]
 	show_screen("over")
 
 
@@ -356,6 +367,7 @@ func show_screen(name: String) -> void:
 
 func _refresh() -> void:
 	buttons["difficulty"].text = "Difficulty: " + Game.DIFF_NAMES[Game.difficulty]
+	buttons["coins"].text = "%d coins" % Game.coins
 	buttons["quality"].text = "Graphics: " + Game.QUALITY_NAMES[Game.quality]
 	buttons["shake"].text = "Screen shake: " + ("On" if Game.shake else "Off")
 	buttons["fps"].text = "Show FPS: " + ("On" if Game.show_fps else "Off")
@@ -382,8 +394,8 @@ class HudDraw extends Control:
 			var bar := Rect2(x, y + 36, w, 24)
 			draw_rect(Rect2(bar.position + Vector2(3, 4), bar.size), Color(0, 0, 0, 0.35))
 			draw_rect(bar, Color(0.15, 0.13, 0.13, 0.85))
-			var f := clampf(l.hp / 100.0, 0.0, 1.0)
-			var gf := clampf(ui.ghost[side] / 100.0, 0.0, 1.0)
+			var f := clampf(l.hp / l.max_hp, 0.0, 1.0)
+			var gf := clampf(ui.ghost[side] / l.max_hp, 0.0, 1.0)
 			var col := Color(0.97, 0.96, 0.9).lerp(Color(0.9, 0.18, 0.12), 1.0 - f)
 			if side == 0:
 				draw_rect(Rect2(bar.position, Vector2(w * gf, bar.size.y)), Color(1.0, 0.75, 0.3))
@@ -442,6 +454,26 @@ func _build_hud() -> void:
 	hint.offset_bottom = -8
 	hint.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	hud.add_child(hint)
+
+
+## "+35 coins" under the big text after a round
+func coins_popup(n: int) -> void:
+	var l := Label.new()
+	l.text = "+%d coins" % n
+	l.add_theme_font_override("font", MARKER)
+	l.add_theme_font_size_override("font_size", 44)
+	_outline(l, 12)
+	l.add_theme_color_override("font_color", Color(1.0, 0.85, 0.25))
+	l.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	l.set_anchors_preset(Control.PRESET_CENTER)
+	l.offset_left = -300
+	l.offset_right = 300
+	l.offset_top = 20
+	hud.add_child(l)
+	var tw := create_tween()
+	tw.tween_interval(1.6)
+	tw.tween_property(l, "modulate:a", 0.0, 0.6)
+	tw.tween_callback(l.queue_free)
 
 
 ## Big text in the middle that pops in (ROUND 1, FIGHT!, K.O.!)
