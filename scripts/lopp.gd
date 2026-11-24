@@ -21,7 +21,7 @@ const PaperShader := preload("res://scripts/paper.gdshader")
 
 const S := 1.0            # half the width (the lopp is 2 units wide, about 8 cm in real life)
 const DEPTH := 1.15       # how far the points stick out (about as tall as they are wide, like a real one)
-const SUB := 9            # each paper face is cut into SUB*SUB cells
+var SUB := 9              # each paper face is cut into SUB*SUB cells (set from the graphics setting)
 const THICK := 0.026      # paper thickness you see on cut/torn edges
 const VIS_OFF := Vector3(0, 0, -DEPTH * 0.5)
 
@@ -36,6 +36,7 @@ const PALETTES := [
 ]
 
 var is_ai := false
+var ai_level := 1          # 0 easy, 1 normal, 2 hard
 var active := false
 var paper_kind := 0        # 0 = math paper (squares), 1 = lined paper
 var enemy = null
@@ -115,6 +116,7 @@ var dirty_q := 0             # which of the 4 points need a new mesh (bit per po
 var pockets: Array = []       # one mesh per point, so a bite only rebuilds what it touched
 var coff := PackedVector3Array()   # cached peel offsets (see _corner_offsets)
 var torn_g := {}              # points in space that touch a rip
+var coff_dirty := {}          # points whose peel offset must be recalculated
 var snaps_since_check := 0    # no snapped bonds = nothing can have come loose
 var _ground := false
 
@@ -487,7 +489,7 @@ func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3) -> Array:
 ## sides of a rip get different offsets - that is what opens the rip without making spiky teeth.
 func _corner_offsets() -> void:
 	var off := coff
-	for g in torn_g:
+	for g in coff_dirty:
 		var corners: PackedInt32Array = gid_corners[g]
 		# group the cells around this point that are still connected to each other here
 		var group := {}
@@ -508,6 +510,7 @@ func _corner_offsets() -> void:
 		for ci in corners:
 			var r: int = _root(group, ci / 3)
 			off[ci] = sum[r] / cnt[r]
+	coff_dirty.clear()
 
 
 func _root(group: Dictionary, x: int) -> int:
@@ -543,6 +546,9 @@ func _rebuild(all := true) -> void:
 # ================================================================ damage
 func _touch(c: int) -> void:
 	dirty_q |= 1 << cquad[c]
+	if calive[c] == 0 and ccurl[c] != Vector3.ZERO:
+		for k in 3:
+			coff_dirty[cgid[c * 3 + k]] = true
 
 
 func _add_dent(center: Vector3, r: float, d: Vector3) -> void:
@@ -663,6 +669,8 @@ func _break_bond(bi: int) -> void:
 			dirty_q |= 1 << cquad[ci / 3]
 	var lift := randf_range(0.01, 0.05)   # torn edges peel up a bit, one side more than the other
 	for c in [bond_a[bi], bond_b[bi]]:
+		for k in 3:
+			coff_dirty[cgid[c * 3 + k]] = true
 		ccurl[c] += cnorm[c] * lift + Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)) * 0.006
 		lift *= 0.3
 
@@ -1111,15 +1119,20 @@ func _ai(delta: float) -> void:
 		in_move = dir * 0.6
 		return
 	if ai_t <= 0.0:
-		ai_t = randf_range(0.12, 0.3)
+		# difficulty: how fast it thinks, how often it bites/dodges/smashes, how long it charges
+		var think: Array = [[0.3, 0.55], [0.12, 0.3], [0.06, 0.16]][ai_level]
+		var bite_p: float = [0.3, 0.55, 0.75][ai_level]
+		var dodge_p: float = [0.08, 0.35, 0.6][ai_level]
+		var smash_p: float = [0.05, 0.12, 0.18][ai_level]
+		ai_t = randf_range(think[0], think[1])
 		if randf() < 0.15:
 			ai_strafe = -ai_strafe
-		if enemy.state == "charge" and d < 2.6 and randf() < 0.35:
+		if enemy.state == "charge" and d < 2.6 and randf() < dodge_p:
 			cmd_dodge()
-		elif d < 2.4 and bite_cd <= 0.0 and randf() < 0.55:
+		elif d < 2.4 and bite_cd <= 0.0 and randf() < bite_p:
 			cmd_bite_start()
-			ai_charge_goal = randf_range(0.15, 0.65)
-		elif d > 1.6 and d < 4.5 and smash_cd <= 0.0 and randf() < 0.12:
+			ai_charge_goal = randf_range(0.1, 0.4) if ai_level == 0 else randf_range(0.2 + 0.1 * ai_level, 0.7)
+		elif d > 1.6 and d < 4.5 and smash_cd <= 0.0 and randf() < smash_p:
 			cmd_smash()
 	var want_d := 1.9 if bite_cd <= 0.0 else 3.0
 	if hp < 35.0:

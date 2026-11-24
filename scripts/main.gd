@@ -1,8 +1,10 @@
 extends Node3D
-## LOPP FIGHT - main scene: builds the desk, the light, the camera, the two lopps and the HUD.
+## LOPP FIGHT - main scene: builds the desk, the light, the camera, the two lopps and the UI.
+## Game.mode decides what happens: "menu" = main menu with a CPU-vs-CPU fight behind it,
+## "fight" = you play a round. Every new round reloads this scene; the score lives in Game.
 
 const LoppScript := preload("res://scripts/lopp.gd")
-const DEBRIS_MAX := 160
+const UIScript := preload("res://scripts/ui.gd")
 
 var desk_half := Vector2(15, 8)
 var player
@@ -22,10 +24,13 @@ var autotest := false
 var shooting := false
 var shot_cam := false
 var hits := 0
-
-var hp_fill := {}
-var msg: Label
-var hint: Label
+var menu := false          # true = main menu demo fight
+var ui
+var env: Environment
+var sun: DirectionalLight3D
+var paused := false
+var resume_block := 0      # ignore the click that pressed Resume
+var orbit := 0.0
 
 
 func _ready() -> void:
@@ -39,19 +44,34 @@ func _ready() -> void:
 	_props()
 	debris_root = Node3D.new()
 	add_child(debris_root)
-	player = _make_lopp(Vector3(0, LoppScript.S + 0.05, 3.2), PI, 0, autotest)
+	var uishot := "uishot" in OS.get_cmdline_user_args()
+	if uishot and "fight" in OS.get_cmdline_user_args() and Game.mode == "menu":
+		Game.new_match()
+	menu = Game.mode == "menu" and not autotest and not shooting
+	player = _make_lopp(Vector3(0, LoppScript.S + 0.05, 3.2), PI, 0, autotest or menu)
 	cpu = _make_lopp(Vector3(0, LoppScript.S + 0.05, -3.2), 0.0, 1, true)
+	cpu.ai_level = 1 if menu else Game.difficulty
 	player.enemy = cpu
 	cpu.enemy = player
 	player.died.connect(_on_died)
 	cpu.died.connect(_on_died)
 	_camera()
-	_hud()
+	ui = UIScript.new()
+	ui.main = self
+	add_child(ui)
+	apply_graphics()
+	if menu:
+		ui.show_screen("menu")
+	else:
+		ui.show_screen("")
+		ui.say("ROUND " + str(Game.round_no), 0.6)
 	paper_bits(Vector3(0, -60, 0), Vector3.UP, 1)   # warm-up: prepares the fibre graphics before the first hit
 	if shooting:
 		autotest = true
 		player.is_ai = true
 		_shots()
+	if uishot:
+		_uishots()
 	if autotest:
 		print("AUTOTEST: cells per lopp = ", player.ncells, ", bonds = ", player.nbonds)
 
@@ -59,6 +79,7 @@ func _ready() -> void:
 func _make_lopp(pos: Vector3, yaw: float, kind: int, ai: bool):
 	var l = LoppScript.new()
 	l.paper_kind = kind
+	l.SUB = Game.paper_detail()
 	l.is_ai = ai
 	l.main = self
 	l.position = pos
@@ -90,7 +111,7 @@ func _inputs() -> void:
 	_key("smash", [KEY_K], MOUSE_BUTTON_RIGHT)
 	_key("dodge", [KEY_SPACE])
 	_key("restart", [KEY_R])
-	_key("quit", [KEY_ESCAPE])
+	_key("pause", [KEY_ESCAPE, KEY_P])
 
 
 # ================================================================ sound (all cut from Sixten's own paper recordings)
@@ -110,7 +131,7 @@ func sfx(name: String, pos: Vector3, db := 0.0) -> void:
 	last_sfx[name] = now
 	var p := AudioStreamPlayer3D.new()
 	p.stream = sounds[name].pick_random()
-	p.volume_db = db
+	p.volume_db = db - (10.0 if menu else 0.0)
 	p.pitch_scale = randf_range(0.92, 1.08)
 	p.unit_size = 8.0
 	add_child(p)
@@ -122,8 +143,9 @@ func sfx(name: String, pos: Vector3, db := 0.0) -> void:
 func add_debris(rb: RigidBody3D, pos: Vector3) -> void:
 	debris_root.add_child(rb)
 	rb.global_position = pos
+	rb.set_meta("born", t)
 	debris.append(rb)
-	while debris.size() > DEBRIS_MAX:
+	while debris.size() > Game.max_debris():
 		var old = debris.pop_front()
 		if is_instance_valid(old):
 			old.queue_free()
@@ -178,13 +200,14 @@ func paper_bits(pos: Vector3, dir: Vector3, amount: int) -> void:
 
 func on_hit(_attacker, _victim, strength: float) -> void:
 	hits += 1
-	cam_shake = maxf(cam_shake, 0.08 + 0.12 * strength)
+	if Game.shake:
+		cam_shake = maxf(cam_shake, 0.08 + 0.12 * strength)
 	hitstop_until = Time.get_ticks_msec() + int(40 + 50 * strength)   # tiny freeze = hits feel heavy
 
 
 # ================================================================ world
 func _environment() -> void:
-	var env := Environment.new()
+	env = Environment.new()
 	var sky := Sky.new()
 	var pm := PanoramaSkyMaterial.new()
 	pm.panorama = load("res://assets/hdri/room.hdr")
@@ -205,7 +228,7 @@ func _environment() -> void:
 	we.environment = env
 	add_child(we)
 
-	var sun := DirectionalLight3D.new()   # window light
+	sun = DirectionalLight3D.new()   # window light
 	sun.rotation_degrees = Vector3(-38, 35, 0)
 	sun.light_energy = 2.4
 	sun.light_color = Color(1.0, 0.95, 0.86)
@@ -400,6 +423,15 @@ func _camera() -> void:
 
 
 func _update_camera(delta: float) -> void:
+	if menu:
+		orbit += delta * 0.12
+		var mid: Vector3 = (player.global_position + cpu.global_position) * 0.5
+		mid.y = 0.8
+		var want_m := mid + Vector3(sin(orbit) * 7.5, 3.2, cos(orbit) * 7.5)
+		cam.global_position = cam.global_position.lerp(want_m, 1.0 - exp(-2.0 * delta))
+		cam.look_at(mid + Vector3(-1.2, 0, 0).rotated(Vector3.UP, orbit))   # aim a bit off-centre: the menu is on the left
+		cam_attr.dof_blur_far_distance = cam.global_position.distance_to(mid) + 3.0
+		return
 	var p: Vector3 = player.global_position
 	var e: Vector3 = cpu.global_position
 	var dir := e - p
@@ -417,73 +449,113 @@ func _update_camera(delta: float) -> void:
 	cam_attr.dof_blur_far_distance = cam.global_position.distance_to(look) + 3.0
 
 
-# ================================================================ HUD
-func _hud() -> void:
-	var layer := CanvasLayer.new()
-	add_child(layer)
-	for who in ["YOU", "CPU"]:
-		var lbl := Label.new()
-		lbl.text = who
-		lbl.add_theme_font_size_override("font_size", 22)
-		lbl.add_theme_color_override("font_outline_color", Color.BLACK)
-		lbl.add_theme_constant_override("outline_size", 6)
-		layer.add_child(lbl)
-		var bg := ColorRect.new()
-		bg.color = Color(0, 0, 0, 0.55)
-		layer.add_child(bg)
-		var fill := ColorRect.new()
-		fill.color = Color(0.93, 0.92, 0.88)
-		layer.add_child(fill)
-		hp_fill[who] = [lbl, bg, fill]
-	msg = Label.new()
-	msg.add_theme_font_size_override("font_size", 64)
-	msg.add_theme_color_override("font_outline_color", Color.BLACK)
-	msg.add_theme_constant_override("outline_size", 12)
-	msg.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	layer.add_child(msg)
-	hint = Label.new()
-	hint.text = "WASD move   ·   hold LEFT CLICK / J = bite (hold longer = bigger bite)   ·   RIGHT CLICK / K = smash   ·   SPACE = dodge   ·   R = restart"
-	hint.add_theme_font_size_override("font_size", 16)
-	hint.add_theme_color_override("font_outline_color", Color.BLACK)
-	hint.add_theme_constant_override("outline_size", 5)
-	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	layer.add_child(hint)
-	msg.text = "LOPP FIGHT"
+# ================================================================ graphics settings
+func apply_graphics() -> void:
+	var q := Game.quality
+	var web := RenderingServer.get_current_rendering_method() == "gl_compatibility"
+	env.ssao_enabled = q >= 1 and not web
+	env.ssil_enabled = q >= 2 and not web
+	env.glow_enabled = q >= 1
+	sun.shadow_enabled = q >= 1
+	RenderingServer.directional_shadow_atlas_set_size([1024, 2048, 4096 if web else 8192][q], true)
+	cam_attr.dof_blur_far_enabled = q >= 1
+	cam_attr.dof_blur_near_enabled = q >= 2
+	var vp := get_viewport()
+	vp.msaa_3d = Viewport.MSAA_2X if q >= 2 else Viewport.MSAA_DISABLED
+	vp.screen_space_aa = Viewport.SCREEN_SPACE_AA_FXAA if q >= 1 else Viewport.SCREEN_SPACE_AA_DISABLED
+	vp.scaling_3d_scale = [0.75, 1.0, 1.0][q]   # Low draws the 3D in fewer pixels
 
 
-func _update_hud() -> void:
-	var vs := get_viewport().get_visible_rect().size
-	var w := minf(420.0, vs.x * 0.36)
-	for who in ["YOU", "CPU"]:
-		var l = player if who == "YOU" else cpu
-		var parts: Array = hp_fill[who]
-		var x := 30.0 if who == "YOU" else vs.x - 30.0 - w
-		parts[0].position = Vector2(x, 14)
-		parts[1].position = Vector2(x, 46)
-		parts[1].size = Vector2(w, 20)
-		var f := clampf(l.hp / 100.0, 0.0, 1.0)
-		parts[2].size = Vector2(w * f, 20)
-		parts[2].position = Vector2(x if who == "YOU" else x + w * (1.0 - f), 46)
-		parts[2].color = Color(0.93, 0.92, 0.88).lerp(Color(0.85, 0.2, 0.15), 1.0 - f)
-	msg.position = Vector2(0, vs.y * 0.3)
-	msg.size = Vector2(vs.x, 80)
-	hint.position = Vector2(0, vs.y - 34)
-	hint.size = Vector2(vs.x, 24)
+## Paper scraps that have landed and stopped moving get frozen and stop colliding: they still lie
+## on the desk, but the physics engine doesn't have to think about them any more.
+var settle_t := 0.0
+
+
+func _settle_debris(delta: float) -> void:
+	settle_t -= delta
+	if settle_t > 0.0:
+		return
+	settle_t = 0.5
+	for rb in debris:
+		if not is_instance_valid(rb) or rb.freeze:
+			continue
+		var age: float = t - float(rb.get_meta("born", t))
+		if rb.sleeping or (age > 2.5 and rb.linear_velocity.length() < 0.08 and rb.angular_velocity.length() < 0.3):
+			rb.freeze = true
+			rb.collision_layer = 0
+			rb.collision_mask = 0
 
 
 # ================================================================ game flow
+func ui_click() -> void:
+	sfx("hop", cam.global_position + cam.global_transform.basis.z * -2.0, 4.0)
+
+
+func start_match() -> void:
+	Game.new_match()
+	_reload()
+
+
+func to_menu() -> void:
+	Game.mode = "menu"
+	_reload()
+
+
+func _reload() -> void:
+	get_tree().paused = false
+	Engine.time_scale = 1.0
+	get_tree().reload_current_scene()
+
+
+func set_paused(p: bool) -> void:
+	if menu or state == "over":
+		return
+	paused = p
+	get_tree().paused = p
+	Engine.time_scale = 1.0
+	if p:
+		player.cmd_bite_release()
+		ui.show_screen("pause")
+	else:
+		resume_block = Time.get_ticks_msec() + 250
+		ui.show_screen("")
+
+
+func _unhandled_input(e: InputEvent) -> void:
+	if e.is_action_pressed("pause"):
+		if paused and ui.screens["settings"].visible:
+			ui.show_screen("pause")
+		else:
+			set_paused(not paused)
+
+
 func _on_died(l, reason: String) -> void:
 	if state == "over":
 		return
 	state = "over"
 	ko_until = Time.get_ticks_msec() + 1400   # slow motion KO
-	if l == player:
-		msg.text = "YOUR LOPP FELL OFF THE DESK" if reason == "fell" else "YOUR LOPP GOT DESTROYED"
-	else:
-		msg.text = "YOU WIN!" if reason != "fell" else "YOU WIN!  (it fell off the desk)"
-	msg.text += "\n[R] fight again"
 	if autotest:
 		print("AUTOTEST: ", "player" if l == player else "cpu", " died (", reason, ") at t=", snappedf(t, 0.1))
+		return
+	if menu:
+		get_tree().create_timer(3.5, true, false, true).timeout.connect(_reload)   # next demo fight
+		return
+	var winner := 1 if l == player else 0
+	Game.wins[winner] += 1
+	if reason == "fell":
+		ui.say("OFF THE DESK!", 1.6)
+	else:
+		ui.say("K.O.!", 1.6)
+	get_tree().create_timer(2.6, true, false, true).timeout.connect(_after_round.bind(winner))
+
+
+func _after_round(winner: int) -> void:
+	if Game.wins[winner] >= Game.WINS_NEEDED:
+		Engine.time_scale = 1.0
+		ui.show_match_over(winner == 0)
+	else:
+		Game.round_no += 1
+		_reload()
 
 
 func _process(delta: float) -> void:
@@ -496,22 +568,14 @@ func _process(delta: float) -> void:
 	else:
 		Engine.time_scale = 1.0
 
-	if Input.is_action_just_pressed("quit"):
-		get_tree().quit()
-	if Input.is_action_just_pressed("restart"):
-		Engine.time_scale = 1.0
-		get_tree().reload_current_scene()
-		return
-
-	if state == "intro" and not shooting and t > (0.3 if autotest else 1.6):
+	if state == "intro" and not shooting and t > (0.3 if autotest or menu else 1.4):
 		state = "fight"
-		msg.text = "FIGHT!"
+		if not menu and not autotest:
+			ui.say("FIGHT!", 0.5)
 		player.active = true
 		cpu.active = true
-	if state == "fight" and t > 2.6 and msg.text == "FIGHT!":
-		msg.text = ""
 
-	if state == "fight" and not autotest:
+	if state == "fight" and not autotest and not menu and now > resume_block:
 		var x := Input.get_axis("left", "right")
 		var y := Input.get_axis("down", "up")
 		var f := -cam.global_transform.basis.z
@@ -530,9 +594,9 @@ func _process(delta: float) -> void:
 		if Input.is_action_just_pressed("dodge"):
 			player.cmd_dodge()
 
+	_settle_debris(delta)
 	if not shot_cam:
 		_update_camera(delta)
-	_update_hud()
 
 	if autotest:
 		if int(t * 2) != int((t - delta) * 2) and int(t * 2) % 10 == 0:
@@ -581,4 +645,26 @@ func _shots() -> void:
 			await get_tree().process_frame
 		get_viewport().get_texture().get_image().save_png(dir + "/" + name + ".png")
 	print("SHOTS ", dir)
+	get_tree().quit()
+
+
+## UI screenshots:  godot --path . -- uishot   (menu + settings)   /   -- uishot fight   (HUD + pause)
+func _uishots() -> void:
+	var dir := OS.get_user_data_dir() + "/shots"
+	DirAccess.make_dir_recursive_absolute(dir)
+	var tm := get_tree().create_timer(3.0, true, false, true)
+	await tm.timeout
+	if menu:
+		get_viewport().get_texture().get_image().save_png(dir + "/ui_menu.png")
+		ui.show_screen("settings")
+		await get_tree().create_timer(0.5, true, false, true).timeout
+		get_viewport().get_texture().get_image().save_png(dir + "/ui_settings.png")
+	else:
+		player.cmd_bite_start()
+		await get_tree().create_timer(0.4, true, false, true).timeout
+		get_viewport().get_texture().get_image().save_png(dir + "/ui_hud.png")
+		set_paused(true)
+		await get_tree().create_timer(0.5, true, false, true).timeout
+		get_viewport().get_texture().get_image().save_png(dir + "/ui_pause.png")
+	print("UISHOTS ", dir)
 	get_tree().quit()
