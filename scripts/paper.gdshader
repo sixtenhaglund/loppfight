@@ -68,6 +68,6 @@ void fragment() {
 	NORMAL_MAP = texture(fiber_normal, UV * 2.0).rgb;
 	NORMAL_MAP_DEPTH = mix(0.5, 0.08, web);
 #if CURRENT_RENDERER != RENDERER_COMPATIBILITY
-	BACKLIGHT = col * 0.35 * ao;
+	BACKLIGHT = col * 0.55 * ao;   // thin paper: light shines through
 #endif
 }

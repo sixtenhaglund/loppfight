@@ -22,7 +22,7 @@ const PaperShader := preload("res://scripts/paper.gdshader")
 const S := 1.0            # half the width (the lopp is 2 units wide, about 8 cm in real life)
 const DEPTH := 1.15       # how far the points stick out (about as tall as they are wide, like a real one)
 var SUB := 9              # each paper face is cut into SUB*SUB cells (set from the graphics setting)
-const THICK := 0.026      # paper thickness you see on cut/torn edges
+const THICK := 0.008      # paper thickness you see on cut/torn edges (thin printer paper)
 const HZ := -0.3           # the fold-in-half line sticks out at the back (it is also the jaw hinge)
 const VIS_OFF := Vector3(0, 0, -(DEPTH + HZ) * 0.5)
 
@@ -118,6 +118,7 @@ var pockets: Array = []       # one mesh per point, so a bite only rebuilds what
 var coff := PackedVector3Array()   # cached peel offsets (see _corner_offsets)
 var torn_g := {}              # points in space that touch a rip
 var coff_dirty := {}          # points whose peel offset must be recalculated
+var peel_seeds := {}          # cell -> how much the paper peels up there (collected during a hit)
 var snaps_since_check := 0    # no snapped bonds = nothing can have come loose
 var _ground := false
 
@@ -200,7 +201,7 @@ func _build_paper() -> void:
 			# the middle fold line (c0-c1) sticks out at the back, like a real lopp folded in half
 			var c0 := Vector3(0, 0, HZ)
 			var c1 := _corner(Vector3(sx * S, 0, HZ), true)
-			var c2 := _corner(Vector3(sx * S, sy * S, 0), false)
+			var c2 := _corner(Vector3(sx * S * 1.08, sy * S * 1.08, 0.04), false)   # bottom corner flares out
 			var c3 := _corner(Vector3(0, sy * S, HZ * 0.45), false)
 			base_c.append((c0 + c1 + c2 + c3) / 4.0)
 			# the tip sits above the middle of its own square (each point is its own pyramid)
@@ -208,7 +209,7 @@ func _build_paper() -> void:
 			tips.append(tip)
 			var inside := Vector3(sx * S * 0.35, sy * S * 0.35, DEPTH * 0.25)
 			var col: Color = pal[q]
-			var outer := {"bow": randf_range(0.035, 0.06), "col": col, "marker": 0.93, "lift_opp": -1, "lift": Vector3.ZERO}
+			var outer := {"bow": randf_range(0.06, 0.1), "col": col, "marker": 0.93, "lift_opp": -1, "lift": Vector3.ZERO}
 			var inner := {"bow": randf_range(0.01, 0.025), "col": Color.WHITE, "marker": 0.0, "lift_opp": -1, "lift": Vector3.ZERO}
 			# outside of the point: one square folded along the diagonal (c2 -> tip)
 			# the pocket opening flares out and curls back a little (bent paper, not a cut edge)
@@ -483,6 +484,29 @@ func _arrays_for(cells: PackedInt32Array, xfs: Array, center: Vector3, bent := f
 			var outn := (b - a).cross(fn[idx]).normalized()
 			if outn.dot(a - cen) < 0.0:
 				outn = -outn
+			if cedge[c * 3 + k].size() > 0:   # this edge used to be glued = it is a RIP, not a cut edge
+				var ga := cgid[c * 3 + k]
+				var gb := cgid[c * 3 + (k + 1) % 3]
+				var wa := 0.01 + 0.025 * absf(_hrand(hash(ga) >> 3) * 2.0)
+				var wb := 0.01 + 0.025 * absf(_hrand(hash(gb) >> 3) * 2.0)
+				var mid := (a + b) * 0.5
+				var wm := 0.006 + 0.03 * absf(_hrand(hash(ga * 7 + gb) >> 5) * 2.0)
+				var lift_n := fn[idx] * 0.002
+				var fa := a + outn * wa + lift_n
+				var fb := b + outn * wb + lift_n
+				var fm := mid + outn * wm + lift_n
+				var da := clampf(cv[c * 3 + k].z / DEPTH, 0.0, 1.0)
+				for tri in [[a, mid, fm], [a, fm, fa], [mid, b, fb], [mid, fb, fm]]:
+					var q0: Vector3 = tri[0]
+					var q1: Vector3 = tri[1]
+					var q2: Vector3 = tri[2]
+					var ord := [q0, q2, q1] if (q1 - q0).cross(q2 - q0).dot(fn[idx]) > 0.0 else [q0, q1, q2]
+					for p in ord:
+						verts.append(p)
+						norms.append(fn[idx])
+						uvs.append(cuv[c * 3 + k])
+						uv2s.append(Vector2(1.08, 0.0))
+						cols.append(Color(1, 1, 1, da))
 			for tri in [[a, b, b + off], [a, b + off, a + off]]:
 				var p0: Vector3 = tri[0]
 				var p1: Vector3 = tri[1]
@@ -582,7 +606,7 @@ func _add_dent(center: Vector3, r: float, d: Vector3) -> void:
 			f = f * f * (3.0 - 2.0 * f)
 			var p := v * 3.6 + off
 			var nz := Vector3(noise.get_noise_3dv(p), noise.get_noise_3dv(p + Vector3(19, 7, 3)), noise.get_noise_3dv(p + Vector3(5, 23, 11)))
-			cdisp[i] += d * f + nz * dl * 1.1 * f
+			cdisp[i] += d * f + nz * dl * 1.5 * f   # dent + sharp crumple creases
 			dirty_q |= 1 << cquad[i / 3]
 
 
@@ -608,9 +632,12 @@ func receive_hit(gpoint: Vector3, gsource: Vector3, power: float, radius: float,
 			_touch(c)
 
 	if kind == "smash":
-		_add_dent(lp, radius * 1.5, push * 0.3 * power)
+		_add_dent(lp, radius * 1.4, push * 0.38 * power)
 	else:
-		_add_dent(lp, radius * 1.1, push * 0.12 * power)
+		# teeth marks: the two jaws pinch the paper from above and below
+		var up := Vector3(0, 0.14, 0)
+		_add_dent(lp + up, radius * 0.8, (push + Vector3(0, -0.6, 0)).normalized() * 0.16 * power)
+		_add_dent(lp - up, radius * 0.8, (push + Vector3(0, 0.6, 0)).normalized() * 0.16 * power)
 
 	var snapped := PackedInt32Array()
 	# only bonds next to damaged cells can snap
@@ -660,6 +687,7 @@ func receive_hit(gpoint: Vector3, gsource: Vector3, power: float, radius: float,
 		var bi := snapped[randi() % snapped.size()]
 		_run_tear(bi, int(tear * randf_range(0.6, 1.3)), lp)
 
+	_apply_peel()
 	var lost := _detach_loose(push)
 	hp = maxf(0.0, hp - hp_dmg - lost * 90.0 / ncells)
 	linear_velocity += knock
@@ -688,12 +716,51 @@ func _break_bond(bi: int) -> void:
 		torn_g[g] = true
 		for ci in gid_corners[g]:
 			dirty_q |= 1 << cquad[ci / 3]
-	var lift := randf_range(0.01, 0.05)   # torn edges peel up a bit, one side more than the other
-	for c in [bond_a[bi], bond_b[bi]]:
-		for k in 3:
-			coff_dirty[cgid[c * 3 + k]] = true
-		ccurl[c] += cnorm[c] * lift + Vector3(randf_range(-1, 1), randf_range(-1, 1), randf_range(-1, 1)) * 0.006
-		lift *= 0.3
+	# a rip lets the paper on ONE side peel up like a flap: strongest at the rip, fading out
+	# over a few cells (cells that are still glued together move together, see _corner_offsets)
+	var a := bond_a[bi]
+	var b := bond_b[bi]
+	var side := a if randf() < 0.5 else b
+	var other := b if side == a else a
+	var lift := randf_range(0.015, 0.05)
+	peel_seeds[side] = maxf(float(peel_seeds.get(side, 0.0)), lift)   # spread later, all at once
+	ccurl[other] += cnorm[other] * lift * 0.15
+	for k in 3:
+		coff_dirty[cgid[other * 3 + k]] = true
+
+
+## Spread the peel from every rip of this hit in ONE search: each cell takes the strongest peel
+## that reaches it, fading out over 3 rings of neighbours (on the same face of paper).
+func _apply_peel() -> void:
+	if peel_seeds.is_empty():
+		return
+	var best := {}
+	var ring: Array = []
+	for c in peel_seeds:
+		best[c] = peel_seeds[c]
+		ring.append(c)
+	for depth in 4:
+		var next: Array = []
+		var f := 1.0 - depth / 4.0
+		for c in ring:
+			if calive[c] == 0:
+				continue
+			var lift: float = best[c]
+			ccurl[c] += cnorm[c] * lift * f
+			dirty_q |= 1 << cquad[c]
+			for k in 3:
+				coff_dirty[cgid[c * 3 + k]] = true
+				if depth == 3:
+					continue
+				for nb in cedge[c * 3 + k]:
+					if bond_ok[nb] == 0:
+						continue
+					var o := bond_b[nb] if bond_a[nb] == c else bond_a[nb]
+					if cface[o] == cface[c] and not best.has(o):
+						best[o] = lift
+						next.append(o)
+		ring = next
+	peel_seeds.clear()
 
 
 ## A rip running through the paper: from its tip, snap the next edge that goes roughly the same way.
@@ -848,21 +915,13 @@ func _die(reason: String) -> void:
 	dead = true
 	hp = 0.0
 	state = "dead"
-	_add_dent(Vector3(0, 0, DEPTH * 0.5), 1.7, Vector3(0, -0.3, -0.25))
-	# the whole thing comes apart along its folds
-	for bi in nbonds:
-		if bond_ok[bi] == 1 and (randf() < 0.12 or (cface[bond_a[bi]] != cface[bond_b[bi]] and randf() < 0.45)):
-			_break_bond(bi)
-	_detach_loose(Vector3(0, 0.5, 1))
-	dirty_q = 15
-	_rebuild()
+	# a beaten lopp doesn't explode: it goes limp, the points sag, the jaws hang open and it tips over
 	axis_lock_angular_x = false
 	axis_lock_angular_z = false
-	apply_torque_impulse(Vector3(randf_range(-1, 1), 0, randf_range(-1, 1)) * 0.8)
-	open_target = 0.5
+	apply_torque_impulse(Vector3(randf_range(-1, 1), 0, randf_range(-1, 1)) * 0.5)
+	open_target = 0.45
 	if main:
-		main.sfx("crumple", global_position, 2.0)
-		main.paper_bits(global_position, Vector3.UP, 60)
+		main.sfx("thump", global_position, -4.0)
 	died.emit(self, reason)
 
 
@@ -1070,7 +1129,7 @@ func _flop(delta: float) -> void:
 		var tipv: Vector3 = tips[q]
 		# the body moved, the soft tips get left behind; turning swings them sideways
 		bend_v[q] += -dv * 0.32 + Vector3(-dyaw * tipv.z * 1.4, 0, 0)
-		var f: Vector3 = -(bend[q] - bend_set[q]) * kq - bend_v[q] * 4.5 + down * kq * 0.045   # spring + damping + droop
+		var f: Vector3 = -(bend[q] - bend_set[q]) * kq - bend_v[q] * 4.5 + down * kq * (0.3 if dead else 0.045)   # spring + damping + droop (dead = limp)
 		bend_v[q] += f * delta
 		bend[q] = (bend[q] + bend_v[q] * delta).limit_length(1.3)
 		var jaw: Node3D = pockets[q].get_parent()
